@@ -62,8 +62,10 @@ Notes that matter:
   how the "every release needs manual approval" condition is met. Give the job a generous timeout.
 - The release job already runs in a GitHub environment that can require a reviewer; that gate and the
   SignPath approval are independent, and both are worth keeping.
-- The release workflow itself lives on the `feat/nuget-release-workflow` branch and is not on `main`
-  yet, so these steps are written here rather than committed into a workflow that does not exist.
+- These steps are written here rather than committed into
+  [`.github/workflows/release.yml`](../.github/workflows/release.yml), because the SignPath
+  organization id, project slug and API token they need do not exist until the subscription does,
+  and a workflow referencing them would fail on the first tag push.
 
 ## Artifact configuration
 
@@ -102,8 +104,7 @@ configuration on every release.
    The free programme is for open source projects, and both are conditions of it.
 2. A release of the package exists in the form that should be signed — the conditions require the
    software to be released already. Publishing is described in
-   [`docs/publishing.md`](publishing.md), which arrives with the `feat/nuget-release-workflow`
-   branch.
+   [`docs/publishing.md`](publishing.md).
 3. Apply at <https://signpath.org/apply>, linking the repository, the release, and
    `CODE_SIGNING_POLICY.md`.
 4. After acceptance: create the SignPath project, the signing policy, the artifact configuration and

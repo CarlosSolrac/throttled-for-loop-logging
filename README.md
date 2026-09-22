@@ -1,4 +1,4 @@
-# throttled-logging-dotnet
+# throttled-for-loop-logging
 
 Throttled `ILogger` instrumentation for long-running .NET functions and the loops inside them.
 
@@ -152,6 +152,14 @@ Set solution-wide in `Directory.Build.props` and `.editorconfig`:
 [`docs/design/throttled-operation-logging.md`](docs/design/throttled-operation-logging.md) carries
 the requirements, the API, the throttling state machine, the thread-safety plan and the reasoning
 behind the ETA. Section 12 lists where the built library differs from the design as first written.
+
+## Publishing
+
+Published as [**ThrottledForLoopLogging**](https://www.nuget.org/packages/ThrottledForLoopLogging)
+— the package ID differs from the assembly name because `ThrottledLogging` was already taken by
+an unrelated package. Releases go to NuGet.org on a tag push, via
+[`.github/workflows/release.yml`](.github/workflows/release.yml); the one-time account and
+credential setup is in [`docs/publishing.md`](docs/publishing.md).
 
 ## Code signing
 

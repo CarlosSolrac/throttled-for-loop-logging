@@ -1,0 +1,135 @@
+# Publish ThrottledLogging to NuGet.org.
+#
+# Releasing is a tag push:
+#
+#   1. bump <Version> in Directory.Build.props, commit it to main;
+#   2. git tag v0.1.0-alpha && git push origin v0.1.0-alpha
+#
+# The tag is a confirmation, not the source of truth — Directory.Build.props holds the
+# version and this workflow refuses to publish if the two disagree, so a mistyped tag
+# cannot ship a surprise version. A NuGet package can be unlisted but never deleted or
+# replaced, so everything that can be checked is checked before the push.
+#
+# workflow_dispatch runs the same build and pack and uploads the package as an artifact
+# WITHOUT publishing it, which is the way to rehearse a release.
+#
+# One-time setup lives in docs/publishing.md.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  ContinuousIntegrationBuild: true
+
+jobs:
+  publish:
+    name: Pack and publish
+    runs-on: ubuntu-latest
+
+    # The environment is what makes a publish reviewable: add a required reviewer to it in
+    # Settings > Environments and every tag push waits for a human before anything reaches
+    # NuGet.org. With no protection rules configured it is a no-op, so the workflow works
+    # either way. A trusted publishing policy that names an environment must name this one.
+    environment: nuget
+
+    permissions:
+      contents: read
+      # Lets the job mint a GitHub OIDC token, which NuGet/login exchanges for a
+      # short-lived API key. Harmless when publishing with a stored API key instead.
+      id-token: write
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      # The package version is whatever Directory.Build.props says. On a tag push the tag
+      # has to agree with it, which catches the two ways a release goes wrong: tagging
+      # without bumping, and bumping to something other than what was tagged.
+      - name: Resolve and verify the version
+        id: version
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's:.*<Version>\(.*\)</Version>.*:\1:p' Directory.Build.props | head -1)
+          if [ -z "$version" ]; then
+            echo "::error::No <Version> found in Directory.Build.props."
+            exit 1
+          fi
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tagged=${GITHUB_REF_NAME#v}
+            if [ "$tagged" != "$version" ]; then
+              echo "::error::Tag ${GITHUB_REF_NAME} does not match <Version>${version}</Version> in Directory.Build.props. Bump the version, commit it, then re-tag."
+              exit 1
+            fi
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Packaging version ${version}."
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore --configuration Release
+
+      # Publishing is irreversible, so the tests gate it even though CI already ran them
+      # on main. This runs on Linux only; the Windows leg is CI's job, pre-merge.
+      - name: Test
+        run: dotnet test --no-build --configuration Release
+
+      - name: Pack
+        run: dotnet pack src/ThrottledLogging/ThrottledLogging.csproj --no-build --configuration Release --output artifacts
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: nupkg-${{ steps.version.outputs.version }}
+          path: |
+            artifacts/*.nupkg
+            artifacts/*.snupkg
+
+      # Trusted publishing: no stored key, just a token this repository proves it owns,
+      # traded for an API key that expires in an hour. Skipped when the NUGET_USER
+      # repository variable is unset, in which case the push below falls back to the
+      # NUGET_API_KEY secret.
+      - name: Request a short-lived NuGet API key
+        id: nuget-login
+        if: github.event_name == 'push' && vars.NUGET_USER != ''
+        uses: NuGet/login@v1
+        with:
+          user: ${{ vars.NUGET_USER }}
+
+      # Only a tag push publishes. A manual run stops at the artifact above.
+      - name: Publish to NuGet.org
+        if: github.event_name == 'push'
+        env:
+          # The short-lived key when trusted publishing is configured, the stored secret otherwise.
+          NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY || secrets.NUGET_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NUGET_API_KEY}" ]; then
+            echo "::error::No NuGet credentials. Set the NUGET_USER repository variable for trusted publishing, or the NUGET_API_KEY secret. See docs/publishing.md."
+            exit 1
+          fi
+          # A matching .snupkg beside the .nupkg is pushed with it automatically, so the
+          # symbol package needs no separate step. --skip-duplicate makes a re-run of a
+          # half-finished release a no-op rather than an error.
+          for package in artifacts/*.nupkg; do
+            echo "Pushing ${package}"
+            dotnet nuget push "${package}" \
+              --api-key "${NUGET_API_KEY}" \
+              --source https://api.nuget.org/v3/index.json \
+              --skip-duplicate
+          done
