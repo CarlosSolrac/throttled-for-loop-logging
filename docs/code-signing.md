@@ -96,19 +96,18 @@ Check the element names against the
 paste it in, and parameterise the version rather than hard-coding it if you would rather not edit the
 configuration on every release.
 
-## Steps that only a maintainer can take
+## Steps that happen outside this repository
 
-1. Make the repository public. The free programme is for open source projects, and the SignPath
-   GitHub App reads the workflow audit log of a repository it can see.
-2. Publish a release of the package in the form that should be signed — the conditions require the
-   software to be released already. This depends on the NuGet publishing work on
-   `feat/nuget-release-workflow`.
-3. Enable two-factor authentication on GitHub and on SignPath for everyone with write access, and
-   require it on the repository.
-4. Apply at <https://signpath.org/apply>, linking the repository, the release, and
+1. The repository is public, and everyone with write access has two-factor authentication enabled.
+   The free programme is for open source projects, and both are conditions of it.
+2. A release of the package exists in the form that should be signed — the conditions require the
+   software to be released already. Publishing is described in
+   [`docs/publishing.md`](publishing.md), which arrives with the `feat/nuget-release-workflow`
+   branch.
+3. Apply at <https://signpath.org/apply>, linking the repository, the release, and
    `CODE_SIGNING_POLICY.md`.
-5. After acceptance: create the SignPath project, the signing policy, the artifact configuration and
+4. After acceptance: create the SignPath project, the signing policy, the artifact configuration and
    an API token; add `SIGNPATH_API_TOKEN` as a repository secret and `SIGNPATH_ORGANIZATION_ID` as a
    repository variable; install the SignPath GitHub App.
-6. Add the signing steps above to the release workflow, and confirm the project name used in the
+5. Add the signing steps above to the release workflow, and confirm the project name used in the
    artifact configuration matches the `Product` property in `Directory.Build.props`.
