@@ -6,32 +6,34 @@ and all of it needs a human — nothing here can be automated from the repositor
 
 ## Before the first release
 
-### 1. Pick a package ID that is free
+### 1. The package ID
 
-**`ThrottledLogging` is taken.** It belongs to an unrelated package by `coldhighsun`
-(a per-key duplicate-message suppressor), first published April 2026 and still active —
-[nuget.org/packages/ThrottledLogging](https://www.nuget.org/packages/ThrottledLogging).
-Pushing under that ID fails with a 403, so the ID has to change before anything is published.
+The package is **`ThrottledForLoopLogging`**, set as `<PackageId>` in
+`src/ThrottledLogging/ThrottledLogging.csproj`. It matches the repository name and was free on
+NuGet.org as of 2026-09-22.
 
-The ID is `<PackageId>` in `src/ThrottledLogging/ThrottledLogging.csproj`. It is independent
-of the assembly name and the namespace, so only that one line has to move — though if the
-assembly name stays `ThrottledLogging` too, a consumer who somehow referenced both packages
-would have two `ThrottledLogging.dll` files to choose between. Renaming the assembly as well
-avoids that, at the cost of a wider change.
+It is deliberately *not* `ThrottledLogging`: that ID belongs to an unrelated package by
+`coldhighsun` (a per-key duplicate-message suppressor), published since April 2026 and still
+active — [nuget.org/packages/ThrottledLogging](https://www.nuget.org/packages/ThrottledLogging).
+Pushing under it would fail with a 403.
 
-Checked and free at the time of writing: `CarlosK.ThrottledLogging`,
-`ThrottledOperationLogging`, `ThrottledLogging.Operations`, `OperationThrottledLogging`,
-`ThrottledProgressLogging`. Confirm whichever you choose is still free just before publishing:
+The package ID is independent of the assembly name and the namespace, which both remain
+`ThrottledLogging`. That is fine in practice; the only wrinkle is that a consumer who somehow
+referenced both packages would have two `ThrottledLogging.dll` files to choose between.
+
+Confirm the ID is still free just before the first publish — until a package is pushed, nothing
+reserves it:
 
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' \
-  https://api.nuget.org/v3/registration5-semver1/<lowercased-id>/index.json
+  https://api.nuget.org/v3/registration5-semver1/throttledforlooplogging/index.json
 # 404 = free, 200 = taken
 ```
 
-A prefixed ID (`CarlosK.*`) is also the one that can be reserved: nuget.org grants an ID
-prefix to an owner, so `CarlosK.*` can be made yours and nobody else's, which is not
-possible for a bare word like `ThrottledLogging`.
+NuGet can reserve an ID *prefix* to an owner, but only a prefix — a bare word like
+`ThrottledForLoopLogging` cannot be reserved, so publishing early is what claims it. Moving to a
+prefixed ID such as `CarlosK.ThrottledForLoopLogging` is the option that could be reserved, and
+it has to be decided before the first push, not after.
 
 ### 2. Create the NuGet.org account
 
@@ -45,7 +47,7 @@ refers to.
 it is this repository using a GitHub OIDC token and gets an API key that expires in an hour.
 
 - On nuget.org: your username → **Trusted Publishing** → add a policy with
-  repository owner `CarlosSolrac`, repository `throttled-logging-dotnet`, workflow file
+  repository owner `CarlosSolrac`, repository `throttled-for-loop-logging`, workflow file
   `release.yml`, environment `nuget`.
 - On GitHub: Settings → Secrets and variables → Actions → **Variables** → add
   `NUGET_USER` with your nuget.org username (the username, not the email address).
@@ -53,7 +55,7 @@ it is this repository using a GitHub OIDC token and gets an API key that expires
 The workflow uses trusted publishing whenever `NUGET_USER` is set.
 
 **An API key (the fallback).** On nuget.org: your username → **API Keys** → create a key
-scoped to **Push** for your chosen package ID (glob patterns such as `CarlosK.*` work), with
+scoped to **Push** for `ThrottledForLoopLogging` (glob patterns work too), with
 the shortest expiry you can live with. Then on GitHub: Settings → Secrets and variables →
 Actions → **Secrets** → add `NUGET_API_KEY`. Keys expire, so this is a recurring errand;
 trusted publishing is not.

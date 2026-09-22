@@ -32,8 +32,8 @@
     <Authors>CarlosK</Authors>
     <Copyright>Copyright (c) 2026 CarlosK</Copyright>
     <PackageTags>logging;ilogger;throttling;progress;eta;diagnostics</PackageTags>
-    <PackageProjectUrl>https://github.com/CarlosSolrac/throttled-logging-dotnet</PackageProjectUrl>
-    <RepositoryUrl>https://github.com/CarlosSolrac/throttled-logging-dotnet</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/CarlosSolrac/throttled-for-loop-logging</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/CarlosSolrac/throttled-for-loop-logging</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
     <EmbedUntrackedSources>true</EmbedUntrackedSources>

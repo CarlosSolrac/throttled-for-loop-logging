@@ -13,7 +13,7 @@
 
   <PropertyGroup>
     <IsPackable>true</IsPackable>
-    <PackageId>ThrottledLogging</PackageId>
+    <PackageId>ThrottledForLoopLogging</PackageId>
     <Description>Throttled ILogger helpers for instrumenting long-running functions and loops without flooding the log.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageReadmeFile>README.md</PackageReadmeFile>
