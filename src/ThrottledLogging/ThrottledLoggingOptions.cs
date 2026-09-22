@@ -1,0 +1,34 @@
+namespace ThrottledLogging;
+
+/// <summary>
+/// Process-wide settings for <see cref="IOperationLogger"/>, bindable from configuration.
+/// </summary>
+public sealed class ThrottledLoggingOptions
+{
+    /// <summary>Settings applied to an operation that does not supply its own.</summary>
+    public OperationOptions Defaults { get; set; } = new();
+
+    /// <summary>
+    /// Whether the background sweeper runs. It flushes held events whose time threshold has
+    /// elapsed while nothing is being submitted, so a stalled loop still produces a heartbeat.
+    /// One timer serves the whole process.
+    /// </summary>
+    public bool EnableSweeper { get; set; } = true;
+
+    /// <summary>Shortest sweeper tick. The sweeper aims for a quarter of the tightest active time threshold, clamped to this floor.</summary>
+    public TimeSpan MinimumSweepInterval { get; set; } = TimeSpan.FromSeconds(1);
+
+    /// <summary>Longest sweeper tick.</summary>
+    public TimeSpan MaximumSweepInterval { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Called with every event that survives throttling and reaches the log. Intended for pushing
+    /// the same data to metrics, and for asserting on it in tests without parsing log text.
+    /// </summary>
+    /// <remarks>
+    /// Runs inline on the thread that produced the event, so it must be quick. An exception thrown
+    /// from here is swallowed and noted once at <c>Debug</c> rather than propagated into the
+    /// caller's loop.
+    /// </remarks>
+    public Action<ThrottledEvent>? OnEmitted { get; set; }
+}
