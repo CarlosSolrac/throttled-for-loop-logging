@@ -153,6 +153,18 @@ Set solution-wide in `Directory.Build.props` and `.editorconfig`:
 the requirements, the API, the throttling state machine, the thread-safety plan and the reasoning
 behind the ETA. Section 12 lists where the built library differs from the design as first written.
 
+## Code signing
+
+Releases are not signed yet: an application to the SignPath Foundation's free code signing programme
+for open source projects is pending.
+
+Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by
+[SignPath Foundation](https://signpath.org).
+
+The policy this project publishes under that programme — team roles, privacy statement, what is
+signed and how — is [`CODE_SIGNING_POLICY.md`](CODE_SIGNING_POLICY.md). The build-side wiring is
+described in [`docs/code-signing.md`](docs/code-signing.md).
+
 ## Licence
 
 MIT — see [LICENSE](LICENSE).
