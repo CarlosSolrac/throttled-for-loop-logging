@@ -41,6 +41,25 @@
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
   </PropertyGroup>
 
+  <!--
+    Binary metadata required by the SignPath Foundation conditions for open source projects:
+    the product name attribute must carry the project's name, and the product version attributes
+    must be the same value in every build of a given version, so that the SignPath artifact
+    configuration can enforce them. Everything below is derived from the single Version property.
+
+    IncludeSourceRevisionInInformationalVersion is off deliberately: the SDK otherwise appends
+    "+<commit sha>" to AssemblyInformationalVersion, which is the attribute read as the product
+    version, and that suffix differs from build to build. SourceLink still embeds the commit, so
+    nothing is lost for debugging. See docs/code-signing.md.
+  -->
+  <PropertyGroup>
+    <Product>ThrottledForLoopLogging</Product>
+    <AssemblyVersion>$(Version.Split('-')[0])</AssemblyVersion>
+    <FileVersion>$(Version.Split('-')[0])</FileVersion>
+    <InformationalVersion>$(Version)</InformationalVersion>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+  </PropertyGroup>
+
   <PropertyGroup Condition="'$(ContinuousIntegrationBuild)' == 'true'">
     <Deterministic>true</Deterministic>
     <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
