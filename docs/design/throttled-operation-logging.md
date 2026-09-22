@@ -687,9 +687,17 @@ Only one, and it does not block implementation:
   fix is the deferred `IsSameItem` signature flag (§4.2), which costs 1.8x an increment and
   only when a label is present.
 
+  `samples/ThrottledLogging.RetrySample` now demonstrates this rather than describing it.
+  Its third pass retries one order three hundred times and every emitted line reads
+  `new=True`, which is the same shape three hundred *different* orders would produce; the
+  same order hanging inside a single attempt produces `new=False` sweeper heartbeats and is
+  obviously stuck. Both loops are equally stuck and only one looks it. The sample also shows
+  the choice that comes first: modelling an attempt as an item breaks `Processed`, `Pending`
+  and the ETA, while modelling the whole retry sequence as one item keeps them honest.
+
 ## 11. Tests
 
-These were the red tests written first, in order. The suite has since grown to **62**, adding
+These were the red tests written first, in order. The suite has since grown to **65**, adding
 channel-level tests for the state machine, parallel-submission tests, dependency-injection wiring
 and options validation.
 
