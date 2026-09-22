@@ -153,6 +153,13 @@ Set solution-wide in `Directory.Build.props` and `.editorconfig`:
 the requirements, the API, the throttling state machine, the thread-safety plan and the reasoning
 behind the ETA. Section 12 lists where the built library differs from the design as first written.
 
+## Publishing
+
+Releases go to NuGet.org on a tag push, via
+[`.github/workflows/release.yml`](.github/workflows/release.yml). The one-time account and
+credential setup, and the package ID this library still has to move off, are in
+[`docs/publishing.md`](docs/publishing.md).
+
 ## Licence
 
 MIT — see [LICENSE](LICENSE).
