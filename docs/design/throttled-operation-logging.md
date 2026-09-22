@@ -723,7 +723,7 @@ and options validation.
 
 ## 12. What the built library does differently
 
-Five things changed while building it. Each is a simplification the design did not anticipate
+Seven things changed while building it. Each is a simplification the design did not anticipate
 rather than a change of behaviour, and the sections above now describe the code.
 
 | Design said | Code does | Why |
@@ -733,12 +733,18 @@ rather than a change of behaviour, and the sections above now describe the code.
 | An item disposed with no outcome is "Incomplete" | It is **failed**, tagged `(unrecorded)` | That path is an exception unwinding past the `using`; only the operation level keeps a distinct Incomplete state |
 | (not specified) | `ThrottledLoggingOptions.OnEmitted` | Makes the public `ThrottledEvent` reachable, and lets tests assert on structure rather than log text |
 | (not specified) | Held-back counters settle at emission time | An event still held is submitted but not yet classified; the counters balance once operations end |
+| One progress template | Two templates sharing event id 9004 | A null estimate rendered through the numeric template reads `ETA s (–s)`; the warm-up case says `ETA not yet known` instead |
+| (not specified) | `IOperationLogger.DefaultOptions` and a `configure` overload of `BeginOperation` | Options handed to `BeginOperation` replace the configured defaults wholesale, so a caller setting one property on a `new OperationOptions` silently lost the rest |
 
 Two further notes from building it:
 
 - **`OperationLogger` needs its DI constructor named explicitly.** It offers a second,
   non-DI constructor, and `ActivatorUtilities` cannot choose between them, so
   `AddThrottledLogging` registers it with an explicit factory.
+- **Per-operation options replace the configured defaults; they are not merged into them.**
+  `OperationOptions` has no way to tell "the caller left this alone" from "the caller wants this
+  value", so `BeginOperation` takes what it is handed. `DefaultOptions` hands out a copy of the
+  configured defaults to start from, and the `configure` overload does that for you.
 - **The ETA warm-up gate is elapsed-time as well as sample-count.** Five completed items is not
   enough on its own; `EtaMinimumElapsed` (one second by default) must also have passed, or a loop
   of very fast items would publish an estimate built from nothing.

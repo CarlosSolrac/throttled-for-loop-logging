@@ -65,6 +65,9 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
     }
 
     /// <inheritdoc />
+    public OperationOptions DefaultOptions => _options.Defaults.Clone();
+
+    /// <inheritdoc />
     public IOperationScope BeginOperation(string name, OperationOptions? options = null)
     {
         ArgumentNullException.ThrowIfNull(name);

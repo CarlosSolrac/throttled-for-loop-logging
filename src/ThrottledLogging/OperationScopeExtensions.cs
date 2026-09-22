@@ -7,6 +7,25 @@ namespace ThrottledLogging;
 /// </summary>
 public static class OperationScopeExtensions
 {
+    /// <summary>
+    /// Begins an operation whose settings start from the configured defaults, so a caller that
+    /// wants one setting changed does not have to restate the rest.
+    /// </summary>
+    /// <param name="logger">The operation factory.</param>
+    /// <param name="name">The operation name.</param>
+    /// <param name="configure">Applies the caller's changes to a copy of <see cref="IOperationLogger.DefaultOptions"/>.</param>
+    /// <returns>The operation scope. Dispose it to end the operation.</returns>
+    /// <exception cref="ArgumentNullException">An argument is <see langword="null"/>.</exception>
+    public static IOperationScope BeginOperation(this IOperationLogger logger, string name, Action<OperationOptions> configure)
+    {
+        ArgumentNullException.ThrowIfNull(logger);
+        ArgumentNullException.ThrowIfNull(configure);
+
+        OperationOptions options = logger.DefaultOptions;
+        configure(options);
+        return logger.BeginOperation(name, options);
+    }
+
     /// <summary>Runs a long-running function as an operation, recording its outcome.</summary>
     /// <param name="logger">The operation factory.</param>
     /// <param name="name">The operation name.</param>

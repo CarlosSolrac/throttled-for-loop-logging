@@ -17,11 +17,11 @@ public sealed class OrderImporter(IOperationLogger operations)
 {
     public async Task ImportAsync(IReadOnlyList<Order> orders, CancellationToken ct)
     {
-        using IOperationScope op = operations.BeginOperation("ImportOrders", new OperationOptions
+        using IOperationScope op = operations.BeginOperation("ImportOrders", options =>
         {
-            TotalItems    = orders.Count,
-            EveryItems    = 500,
-            EveryInterval = TimeSpan.FromSeconds(10),
+            options.TotalItems    = orders.Count;
+            options.EveryItems    = 500;
+            options.EveryInterval = TimeSpan.FromSeconds(10);
         });
 
         foreach (Order order in orders)
@@ -42,6 +42,10 @@ public sealed class OrderImporter(IOperationLogger operations)
     }
 }
 ```
+
+That overload starts from the registered defaults and applies your changes on top. Handing
+`BeginOperation` an `OperationOptions` you built with `new` replaces them wholesale instead —
+`IOperationLogger.DefaultOptions` gives you a copy to start from when you need the object itself.
 
 Register it once:
 
@@ -80,10 +84,40 @@ foreach (OperationSnapshot op in await registry.GetActiveOperationsAsync(ct))
 ## Layout
 
 ```
-src/ThrottledLogging            the library      (net8.0; net10.0)
-tests/ThrottledLogging.Tests    xUnit v3 tests   (net10.0)
-docs/design                     the design document and its reasoning
+src/ThrottledLogging               the library        (net8.0; net10.0)
+tests/ThrottledLogging.Tests       xUnit v3 tests     (net10.0)
+samples/ThrottledLogging.Sample    a runnable tour    (net10.0)
+docs/design                        the design document and its reasoning
 ```
+
+## Sample
+
+```bash
+dotnet run --project samples/ThrottledLogging.Sample
+```
+
+It starts three operations at once, loops over a couple of hundred thousand items that mostly
+succeed and sometimes fail, and polls the registry from a fourth thread while they run. Its five
+sections are registration, the delegate form, the explicit form, the live registry and the
+counters. A run ends with something like:
+
+```
+  -- 3 operation(s) in flight --
+  ImportOrders        45,204 processed, 103,542 pending,  1,254 failed, 63 in flight,   23,571/s, ETA 4.0s (between 4.0s and 4.0s, 80 % confidence)
+  ReindexDocuments    23,233 processed,  36,767 pending,      0 failed, 32 in flight,    9,683/s, ETA 4.0s (between 4.0s and 4.0s, 80 % confidence)
+  RepairAccounts         660 processed,   1,775 pending,     65 failed, 1 in flight,      249/s, ETA 7.0s (between 7.0s and 7.0s, 80 % confidence)
+
+Throttle counters
+-----------------
+  progress: 420,719 submitted, 37 logged, 420,682 held back
+  failures: 4,281 submitted, 15 logged, 4,266 held back
+  flushes:  34 by count, 8 by time, 0 by sweeper
+  operations: 3 completed, 0 failed, 0 still active
+  425,000 events became 52 log lines.
+```
+
+The bands are narrow there because the sample's items all take the same two milliseconds; a
+workload with real spread gives a wider one.
 
 ## Getting started
 

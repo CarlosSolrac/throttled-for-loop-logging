@@ -208,22 +208,43 @@ internal sealed class OperationScope : IOperationScope
         }
         else
         {
-            Log.Progress(
-                _logger,
-                level,
-                Name,
-                pending.Label,
-                pending.Outcome,
-                snapshot.Processed,
-                snapshot.Total,
-                snapshot.Failed,
-                emission.IsNew,
-                pending.SubmittedAtUtc,
-                emission.SuppressedSince,
-                snapshot.RatePerSecond,
-                snapshot.Eta.Remaining?.TotalSeconds,
-                snapshot.Eta.RemainingLow?.TotalSeconds,
-                snapshot.Eta.RemainingHigh?.TotalSeconds);
+            // During the ETA warm-up there is no band to print, so the line says so rather than
+            // rendering an empty one. See Log.Progress and Log.ProgressWithoutEta.
+            if (snapshot.Eta is { Remaining: { } remaining, RemainingLow: { } low, RemainingHigh: { } high })
+            {
+                Log.Progress(
+                    _logger,
+                    level,
+                    Name,
+                    pending.Label,
+                    pending.Outcome,
+                    snapshot.Processed,
+                    snapshot.Total,
+                    snapshot.Failed,
+                    emission.IsNew,
+                    pending.SubmittedAtUtc,
+                    emission.SuppressedSince,
+                    snapshot.RatePerSecond,
+                    remaining.TotalSeconds,
+                    low.TotalSeconds,
+                    high.TotalSeconds);
+            }
+            else
+            {
+                Log.ProgressWithoutEta(
+                    _logger,
+                    level,
+                    Name,
+                    pending.Label,
+                    pending.Outcome,
+                    snapshot.Processed,
+                    snapshot.Total,
+                    snapshot.Failed,
+                    emission.IsNew,
+                    pending.SubmittedAtUtc,
+                    emission.SuppressedSince,
+                    snapshot.RatePerSecond);
+            }
         }
 
         _owner.NotifyEmitted(new ThrottledEvent

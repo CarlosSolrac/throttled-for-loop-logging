@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>ThrottledLogging.Sample</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <!--
+      A sample is read, not consumed as an API, so it carries no XML documentation and is
+      allowed the plain logging calls a reader expects instead of source-generated ones.
+    -->
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591;CA1848;CA1873</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/ThrottledLogging/ThrottledLogging.csproj" />
+  </ItemGroup>
+
+</Project>
