@@ -47,14 +47,18 @@ jobs:
       - name: Build
         run: dotnet build --no-restore --configuration Release
 
+      # No --report-trx here: TRX output needs the Microsoft.Testing.Extensions.TrxReport
+      # package, and without it Microsoft.Testing.Platform rejects the option and reports
+      # "Zero tests ran". Coverage comes from Microsoft.Testing.Extensions.CodeCoverage,
+      # which the test project already references.
       - name: Test
-        run: dotnet test --no-build --configuration Release --report-trx --report-trx-filename test-results.trx --coverage --coverage-output-format cobertura
+        run: dotnet test --no-build --configuration Release --coverage --coverage-output-format cobertura
 
-      - name: Upload test results
+      - name: Upload coverage
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
-          name: test-results-${{ matrix.os }}
+          name: coverage-${{ matrix.os }}
           path: '**/TestResults/**'
           if-no-files-found: warn
 
