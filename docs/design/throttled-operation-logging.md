@@ -1,6 +1,9 @@
 # ThrottledLogging — API design
 
-Status: **agreed, v0.4** · 2026-09-22 · R13 revised, see §6.7 · no library code written yet
+Status: **implemented, v0.5** · 2026-09-22 · 62 tests green on net8.0 and net10.0
+
+Where the built library differs from the design as written, §12 says so and this document has been
+corrected to describe what exists.
 
 ## 1. What this library is for
 
@@ -139,8 +142,13 @@ new OperationOptions { TotalItems = orders.Count }, ct);
 `ForEachAsync` takes an optional `MaxDegreeOfParallelism`, times each item, and routes
 exceptions to `item.Failure` for you.
 
-If a scope is disposed with neither `Success` nor `Failure` recorded, it is logged as
-**Incomplete** rather than guessed at.
+Disposal without a recorded outcome is treated differently at the two levels, on purpose:
+
+- an **item** counts as **failed**, because the usual way it happens is an exception unwinding
+  past the `using`, and calling that a success would hide exactly the items worth seeing. It
+  appears in the failure breakdown under `(unrecorded)`;
+- an **operation** is logged as **Incomplete**, a state of its own, because at that level there is
+  no useful default and guessing would be worse than saying so.
 
 ## 4. Throttling behaviour (R4–R8, R14)
 
@@ -496,8 +504,12 @@ Two narrower uses, both worth having, neither of them an outcome filter:
    the loop hangs. Counting open item scopes whose elapsed time already exceeds the current
    mean, and flooring the ETA at that elapsed time, fixes a real blind spot.
 2. **Variance clamping.** One pathological ten-minute hang can blow the confidence band
-   wide open for the next fifty items. Winsorising the variance input at roughly p99 keeps
-   the band usable. Relative to the observed distribution, not an absolute second count.
+   wide open for the next fifty items, so the deviation fed to the variance is clamped at four
+   standard deviations of the current distribution — relative to what has been observed, not an
+   absolute second count. The mean still takes the item unclamped, so the estimate follows
+   reality while the band stays usable. (The design first called for winsorising at p99; a
+   k-sigma clamp achieves the same thing without carrying a quantile sketch, and is what the
+   code does.)
 
 **Proposed:** implement both, drop the outcome filter. Flagged rather than assumed, since it
 reverses R13 as originally written.
@@ -518,7 +530,9 @@ public interface IOperationRegistry
     ThrottleCounters GetCounters();
 }
 
-public readonly record struct OperationSnapshot
+// A sealed record rather than a readonly record struct: it carries around twenty members and is
+// normally handed out in lists, so copying would cost more than the allocation saves.
+public sealed record OperationSnapshot
 {
     public required Guid            Id                 { get; init; }
     public required string          Name               { get; init; }
@@ -555,6 +569,9 @@ public readonly record struct EtaEstimate
     public double          Confidence           { get; init; }   // e.g. 0.80
 }
 
+// Held-back events are counted when the line that supersedes them is written, so an event still
+// being held is in EventsSubmitted but in neither of the other two. The three balance once every
+// operation has ended.
 public readonly record struct ThrottleCounters
 {
     public required long EventsSubmitted     { get; init; }
@@ -632,8 +649,9 @@ services.AddThrottledLogging(options =>
 });
 ```
 
-Bindable from `IConfiguration`, and read through `IOptionsMonitor` so thresholds can be
-changed on a running process without a redeploy.
+Bindable from `IConfiguration`. `ThrottledLoggingOptions` also carries an `OnEmitted` observer,
+called with every event that survives throttling, for pushing the same data to metrics and for
+asserting on structure in tests rather than parsing log text.
 
 ## 9. Decisions already taken in the scaffold
 
@@ -669,9 +687,11 @@ Only one, and it does not block implementation:
   fix is the deferred `IsSameItem` signature flag (§4.2), which costs 1.8x an increment and
   only when a label is present.
 
-## 11. Suggested first tests (TDD order)
+## 11. Tests
 
-Once the shape above is agreed, these are the red tests to write first, in order:
+These were the red tests written first, in order. The suite has since grown to **62**, adding
+channel-level tests for the state machine, parallel-submission tests, dependency-injection wiring
+and options validation.
 
 1. `BeginOperation_logs_entry_once`  (R1)
 2. `Operation_logs_success_on_Success`  (R1)
@@ -700,3 +720,31 @@ Once the shape above is agreed, these are the red tests to write first, in order
 21. `Final_summary_reports_failure_counts_by_exception_type`  (R14)
 22. `Failure_type_breakdown_is_capped_and_buckets_the_remainder`  (R14)
 23. `Last_held_failure_is_flushed_when_the_operation_ends`  (R14)
+
+## 12. What the built library does differently
+
+Seven things changed while building it. Each is a simplification the design did not anticipate
+rather than a change of behaviour, and the sections above now describe the code.
+
+| Design said | Code does | Why |
+|---|---|---|
+| `OperationSnapshot` is a `readonly record struct` | `sealed record` | ~20 members handed out in lists; copying costs more than the allocation |
+| Winsorise the variance input at p99 | Clamp the deviation at 4 sigma | Same effect on the band without carrying a P-squared quantile sketch |
+| An item disposed with no outcome is "Incomplete" | It is **failed**, tagged `(unrecorded)` | That path is an exception unwinding past the `using`; only the operation level keeps a distinct Incomplete state |
+| (not specified) | `ThrottledLoggingOptions.OnEmitted` | Makes the public `ThrottledEvent` reachable, and lets tests assert on structure rather than log text |
+| (not specified) | Held-back counters settle at emission time | An event still held is submitted but not yet classified; the counters balance once operations end |
+| One progress template | Two templates sharing event id 9004 | A null estimate rendered through the numeric template reads `ETA s (–s)`; the warm-up case says `ETA not yet known` instead |
+| (not specified) | `IOperationLogger.DefaultOptions` and a `configure` overload of `BeginOperation` | Options handed to `BeginOperation` replace the configured defaults wholesale, so a caller setting one property on a `new OperationOptions` silently lost the rest |
+
+Two further notes from building it:
+
+- **`OperationLogger` needs its DI constructor named explicitly.** It offers a second,
+  non-DI constructor, and `ActivatorUtilities` cannot choose between them, so
+  `AddThrottledLogging` registers it with an explicit factory.
+- **Per-operation options replace the configured defaults; they are not merged into them.**
+  `OperationOptions` has no way to tell "the caller left this alone" from "the caller wants this
+  value", so `BeginOperation` takes what it is handed. `DefaultOptions` hands out a copy of the
+  configured defaults to start from, and the `configure` overload does that for you.
+- **The ETA warm-up gate is elapsed-time as well as sample-count.** Five completed items is not
+  enough on its own; `EtaMinimumElapsed` (one second by default) must also have passed, or a loop
+  of very fast items would publish an estimate built from nothing.
