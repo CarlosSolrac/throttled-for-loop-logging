@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <!-- Tests are self-describing; XML doc comments are not required of them. -->
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <!--
+      CS1591 : tests need no XML docs.
+      CA1707 : Method_names_with_underscores are the xUnit convention and read better in test output.
+      CA1848 : LoggerMessage source generation is for the library's hot path, not for test arrangement.
+      CA1873 : the same, for the guarded-logging analyzer.
+    -->
+    <NoWarn>$(NoWarn);CS1591;CA1707;CA1848;CA1873</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Diagnostics.Testing" />
+    <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" />
+    <PackageReference Include="Microsoft.Testing.Extensions.CodeCoverage" />
+    <PackageReference Include="xunit.v3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/ThrottledLogging/ThrottledLogging.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+</Project>

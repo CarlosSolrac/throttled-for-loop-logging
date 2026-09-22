@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ThrottledLogging/ThrottledLogging.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ThrottledLogging.Tests/ThrottledLogging.Tests.csproj" />
+  </Folder>
+</Solution>

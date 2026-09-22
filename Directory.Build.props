@@ -1,0 +1,49 @@
+<Project>
+
+  <!--
+    Solution-wide build settings.
+
+    Strictness is deliberate: the public surface of this library is small, so every
+    type and member is expected to carry XML documentation and to be nullable-annotated.
+    Warnings are errors so that a documentation or nullability gap fails the build
+    rather than accumulating.
+  -->
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <DebugType>portable</DebugType>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <!--
+    Package and repository identity, shared by every packable project.
+    RepositoryUrl also drives SourceLink, which is in-box from the .NET 8 SDK onwards:
+    PublishRepositoryUrl and EmbedUntrackedSources let a consumer step into this code
+    from a debugger without a separate SourceLink package reference.
+  -->
+  <PropertyGroup>
+    <Version>0.1.0-alpha</Version>
+    <Authors>CarlosK</Authors>
+    <Copyright>Copyright (c) 2026 CarlosK</Copyright>
+    <PackageTags>logging;ilogger;throttling;progress;eta;diagnostics</PackageTags>
+    <PackageProjectUrl>https://github.com/CarlosSolrac/throttled-logging-dotnet</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/CarlosSolrac/throttled-logging-dotnet</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(ContinuousIntegrationBuild)' == 'true'">
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
+  </PropertyGroup>
+
+</Project>

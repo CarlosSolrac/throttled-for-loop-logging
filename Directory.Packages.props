@@ -1,0 +1,34 @@
+<Project>
+
+  <!-- Central Package Management: every version lives here, never in a .csproj. -->
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <!--
+      Transitive pinning is deliberately OFF. The library floors on the 8.0 logging
+      abstractions, while the test-only Microsoft.Extensions.Diagnostics.Testing package
+      pulls the 10.x graph; pinning would force one version on both and drag the library's
+      floor up with it.
+    -->
+    <CentralPackageTransitivePinningEnabled>false</CentralPackageTransitivePinningEnabled>
+  </PropertyGroup>
+
+  <!--
+    The library floors on the 8.0 logging abstractions on purpose: it is the lowest
+    version that carries everything needed, so consumers are never forced to upgrade
+    their Microsoft.Extensions.* graph to take this package.
+  -->
+  <ItemGroup>
+    <PackageVersion Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="8.0.2" />
+    <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.3" />
+    <PackageVersion Include="Microsoft.Extensions.Options" Version="8.0.2" />
+  </ItemGroup>
+
+  <!-- Test-only packages track latest. -->
+  <ItemGroup>
+    <PackageVersion Include="Microsoft.Extensions.Diagnostics.Testing" Version="10.10.0" />
+    <PackageVersion Include="Microsoft.Extensions.TimeProvider.Testing" Version="10.10.0" />
+    <PackageVersion Include="Microsoft.Testing.Extensions.CodeCoverage" Version="18.11.2" />
+    <PackageVersion Include="xunit.v3" Version="4.0.1" />
+  </ItemGroup>
+
+</Project>
