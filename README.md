@@ -1,5 +1,8 @@
 # throttled-for-loop-logging
 
+[![CI](https://github.com/CarlosSolrac/throttled-for-loop-logging/actions/workflows/ci.yml/badge.svg)](https://github.com/CarlosSolrac/throttled-for-loop-logging/actions/workflows/ci.yml)
+[![NuGet](https://img.shields.io/nuget/vpre/ThrottledForLoopLogging)](https://www.nuget.org/packages/ThrottledForLoopLogging)
+
 Throttled `ILogger` instrumentation for long-running .NET functions and the loops inside them.
 
 You get entry and exit visibility, live progress and an ETA — without a log line per iteration.
