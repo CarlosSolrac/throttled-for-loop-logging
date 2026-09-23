@@ -5,6 +5,8 @@
 
 Throttled `ILogger` instrumentation for long-running .NET functions and the loops inside them.
 
+![A for loop on the left submits a started and a succeeded or failed event for every item. ThrottledForLoopLogging, a black box in the middle, holds only the latest event per channel and writes it when a count or time threshold is reached. The console on the right shows the few lines that reach ILogger, including a new=False heartbeat while one item hangs.](https://raw.githubusercontent.com/CarlosSolrac/throttled-for-loop-logging/main/docs/images/throttled-for-loop.svg)
+
 You get entry and exit visibility, live progress and an ETA — without a log line per iteration.
 
 ```
@@ -91,7 +93,12 @@ src/ThrottledLogging               the library        (net8.0; net10.0)
 tests/ThrottledLogging.Tests       xUnit v3 tests     (net10.0)
 samples/ThrottledLogging.Sample    a runnable tour    (net10.0)
 docs/design                        the design document and its reasoning
+tools/ReadmeAnimation              regenerates the animation above (net10.0)
 ```
+
+The animation is drawn from a real run: `dotnet run --project tools/ReadmeAnimation` puts a short
+scripted loop through the library on a fake clock and rewrites `docs/images/throttled-for-loop.svg`
+from what it submitted and what reached the logger.
 
 ## Sample
 
