@@ -181,6 +181,24 @@ Both loops are equally stuck; only the second one looks it. Telling them apart n
 carried alongside `IsNew`, which the library does not do yet — see "Still open" in the design
 document.
 
+## Context across hosts
+
+Everything the library tracks lives in memory, in one process. When a host restarts, recycles or
+scales out, the next run starts fresh. What carries over is the context the host knows about the
+run, and since 0.2.0 that context reaches every line the library writes:
+
+- a logging scope you open before `BeginOperation`, together with `Activity.Current`, is captured
+  and restored for the heartbeat lines the background sweeper writes;
+- `OperationOptions.Scope` attaches your own key/value pairs to one operation's lines;
+- every line carries `OperationId`;
+- disposing `OperationLogger` at shutdown writes out held events and a "still running" line
+  (event 9008) for each unfinished operation.
+
+[`docs/azure-functions-and-application-insights.md`](docs/azure-functions-and-application-insights.md)
+works through Storage queue, Service Bus, timer and Durable Functions triggers with Application
+Insights, plus a console job with no Azure at all, and gives the Kusto queries that stitch the runs
+back together.
+
 ## Getting started
 
 Requires the **.NET 10 SDK** (see `global.json`).

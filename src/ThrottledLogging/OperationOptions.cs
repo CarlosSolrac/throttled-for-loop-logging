@@ -56,8 +56,43 @@ public sealed class OperationOptions
     /// <summary>Elapsed time required before an ETA is offered at all.</summary>
     public TimeSpan EtaMinimumElapsed { get; set; } = TimeSpan.FromSeconds(1);
 
-    /// <summary>Returns an independent copy, so a caller's instance cannot be mutated underneath a running operation.</summary>
-    internal OperationOptions Clone() => (OperationOptions)MemberwiseClone();
+    /// <summary>
+    /// Key/value pairs attached, as a logging scope, to every line this operation writes: entry,
+    /// item, failure, heartbeat, summary and end lines alike.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Use it for whatever identifies the run to whoever reads the log later: a batch id, a file
+    /// name, a queue message id and its delivery count, an Azure Functions invocation id. Sinks
+    /// that understand structured scopes store each pair as its own field (Application Insights
+    /// adds them to <c>customDimensions</c>; the JSON console formatter writes them as properties);
+    /// text sinks with scopes enabled print them as <c>Key:Value, Key:Value</c>. A sink that ignores
+    /// scopes ignores these too, and the operation id on every line still identifies the run.
+    /// </para>
+    /// <para>
+    /// The dictionary is copied when the operation begins, so changing it afterwards has no effect
+    /// on an operation already running. <see langword="null"/> or empty opens no scope at all.
+    /// </para>
+    /// <para>
+    /// This is not the only way context reaches the log. The operation also remembers the caller's
+    /// own logging scopes and <see cref="System.Diagnostics.Activity"/> from the moment it began,
+    /// and restores them for lines written by the background sweeper. Values already in a scope the
+    /// caller opened therefore need not be repeated here; a sink with scopes enabled would print
+    /// them twice.
+    /// </para>
+    /// </remarks>
+    public IReadOnlyDictionary<string, object?>? Scope { get; set; }
+
+    /// <summary>
+    /// Returns an independent copy, so a caller's instance cannot be mutated underneath a running
+    /// operation. <see cref="Scope"/> is copied too, not shared.
+    /// </summary>
+    internal OperationOptions Clone()
+    {
+        OperationOptions copy = (OperationOptions)MemberwiseClone();
+        copy.Scope = Scope is null ? null : new Dictionary<string, object?>(Scope, StringComparer.Ordinal);
+        return copy;
+    }
 
     /// <summary>Throws when any setting is outside its supported range.</summary>
     /// <exception cref="ArgumentOutOfRangeException">A setting is invalid.</exception>

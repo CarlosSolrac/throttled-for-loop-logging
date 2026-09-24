@@ -6,6 +6,11 @@ namespace ThrottledLogging.Internal;
 /// <summary>One long-running function. See <see cref="IOperationScope"/>.</summary>
 internal sealed class OperationScope : IOperationScope
 {
+    // ExecutionContext.Run takes a static callback plus a state object; these avoid allocating a
+    // closure on every sweep.
+    private static readonly ContextCallback SweepCallback = static state => ((OperationScope)state!).SweepCore();
+    private static readonly ContextCallback ShutdownCallback = static state => ((OperationScope)state!).FlushForShutdownCore();
+
     private readonly OperationLogger _owner;
     private readonly ILogger _logger;
     private readonly OperationOptions _options;
@@ -14,6 +19,17 @@ internal sealed class OperationScope : IOperationScope
     private readonly FailureBreakdown _breakdown;
     private readonly ConcurrentDictionary<long, long> _inFlight = new();
     private readonly long _startTimestamp;
+
+    // The caller's ambient context at BeginOperation: its logging scopes (Microsoft.Extensions.Logging
+    // keeps them in an AsyncLocal), Activity.Current (which Application Insights reads for
+    // operation_Id), and any other AsyncLocal. Lines written on the caller's own thread have all of
+    // this anyway; lines written by the sweeper's timer thread or by OperationLogger.Dispose would
+    // have none of it, so those paths run inside this context instead. Null when the caller
+    // suppressed flow, in which case those lines run bare, exactly as they did before 0.2.0.
+    private readonly ExecutionContext? _callerContext;
+
+    // OperationOptions.Scope, wrapped once for the whole operation. Null when there is nothing to attach.
+    private readonly ContextScopeState? _scopeState;
 
     private long _processed;
     private long _failed;
@@ -42,6 +58,12 @@ internal sealed class OperationScope : IOperationScope
         Failures = new ThrottleChannel(options.FailureEveryItems, options.FailureEveryInterval, time);
         _statistics = new DurationStatistics(options.EtaHalfLifeItems, time);
         _breakdown = new FailureBreakdown(options.MaxTrackedFailureTypes);
+
+        _callerContext = ExecutionContext.Capture();
+        if (options.Scope is { Count: > 0 } scope)
+        {
+            _scopeState = new ContextScopeState(scope);
+        }
     }
 
     /// <inheritdoc />
@@ -132,7 +154,11 @@ internal sealed class OperationScope : IOperationScope
     }
 
     /// <summary>Writes the entry line. Called once, by the factory, after registration.</summary>
-    public void LogEntry() => Log.OperationStarted(_logger, _options.Level, Name, Id, _options.TotalItems);
+    public void LogEntry()
+    {
+        using IDisposable? scope = BeginContextScope();
+        Log.OperationStarted(_logger, _options.Level, Name, Id, _options.TotalItems);
+    }
 
     /// <summary>Records the outcome of one item. Called by <see cref="ItemScope"/>.</summary>
     /// <param name="id">The in-flight identifier.</param>
@@ -162,8 +188,81 @@ internal sealed class OperationScope : IOperationScope
         }
     }
 
-    /// <summary>Lets the background sweeper release held events whose time threshold has passed.</summary>
+    /// <summary>
+    /// Lets the background sweeper release held events whose time threshold has passed. Runs in
+    /// the caller's captured context, so a heartbeat carries the same scopes and trace as the lines
+    /// the caller's own thread writes.
+    /// </summary>
     public void Sweep()
+    {
+        if (HasEnded)
+        {
+            return;
+        }
+
+        RunInCallerContext(SweepCallback);
+    }
+
+    /// <summary>
+    /// Called by <see cref="OperationLogger.Dispose"/> for an operation that has not ended: writes
+    /// out whatever is held on both channels, then one line saying the operation was still running.
+    /// </summary>
+    /// <remarks>
+    /// The operation is deliberately left open. Hosts dispose the logger while shutting down, and
+    /// the caller's loop may still be draining; ending the scope here would make its next
+    /// <see cref="BeginItem"/> throw. If the caller does end it later, the usual closing line
+    /// follows. If the process dies first, the shutdown line is the operation's last word, with
+    /// the counts it had reached.
+    /// </remarks>
+    public void FlushForShutdown()
+    {
+        if (HasEnded)
+        {
+            return;
+        }
+
+        RunInCallerContext(ShutdownCallback);
+    }
+
+    private void RunInCallerContext(ContextCallback callback)
+    {
+        if (_callerContext is null)
+        {
+            callback(this);
+            return;
+        }
+
+        // A captured ExecutionContext is immutable and may be run any number of times, from any
+        // thread, including concurrently (true on .NET Core and later, which is all this targets).
+        ExecutionContext.Run(_callerContext, callback, this);
+    }
+
+    private void FlushForShutdownCore()
+    {
+        if (Progress.Flush() is { } heldProgress)
+        {
+            Emit(heldProgress, _options.Level);
+        }
+
+        if (Failures.Flush() is { } heldFailure)
+        {
+            Emit(heldFailure, _options.FailureLevel);
+        }
+
+        OperationSnapshot snapshot = Snapshot();
+        using IDisposable? scope = BeginContextScope();
+        Log.OperationStillRunningAtShutdown(
+            _logger,
+            _options.FailureLevel,
+            Name,
+            Id,
+            snapshot.Elapsed.TotalSeconds,
+            snapshot.Processed,
+            snapshot.Failed,
+            snapshot.InFlight);
+    }
+
+    private void SweepCore()
     {
         if (HasEnded)
         {
@@ -197,14 +296,24 @@ internal sealed class OperationScope : IOperationScope
         }
     }
 
+    /// <summary>
+    /// Opens <see cref="OperationOptions.Scope"/> on this operation's logger, or does nothing when
+    /// there is none. Each line opens and closes it around itself rather than holding it for the
+    /// operation's lifetime, because logging scopes live in the ambient context of whichever thread
+    /// writes, and an operation's lines are written from several.
+    /// </summary>
+    /// <returns>The scope to dispose, or <see langword="null"/>.</returns>
+    private IDisposable? BeginContextScope() => _scopeState is null ? null : _logger.BeginScope(_scopeState);
+
     private void Emit(in Emission emission, LogLevel level)
     {
         OperationSnapshot snapshot = Snapshot();
         PendingEvent pending = emission.Event;
+        using IDisposable? scope = BeginContextScope();
 
         if (pending.Outcome == ItemOutcome.Failed)
         {
-            Log.ItemFailed(_logger, level, pending.Error, Name, pending.Label, snapshot.Failed, emission.IsNew, pending.SubmittedAtUtc, emission.SuppressedSince);
+            Log.ItemFailed(_logger, level, pending.Error, Name, Id, pending.Label, snapshot.Failed, emission.IsNew, pending.SubmittedAtUtc, emission.SuppressedSince);
         }
         else
         {
@@ -216,6 +325,7 @@ internal sealed class OperationScope : IOperationScope
                     _logger,
                     level,
                     Name,
+                    Id,
                     pending.Label,
                     pending.Outcome,
                     snapshot.Processed,
@@ -235,6 +345,7 @@ internal sealed class OperationScope : IOperationScope
                     _logger,
                     level,
                     Name,
+                    Id,
                     pending.Label,
                     pending.Outcome,
                     snapshot.Processed,
@@ -297,6 +408,7 @@ internal sealed class OperationScope : IOperationScope
 
         OperationSnapshot snapshot = Snapshot();
         double elapsedSeconds = snapshot.Elapsed.TotalSeconds;
+        using IDisposable? scope = BeginContextScope();
 
         if (snapshot.Failed > 0 && _logger.IsEnabled(_options.FailureLevel))
         {
@@ -306,6 +418,7 @@ internal sealed class OperationScope : IOperationScope
                 _logger,
                 _options.FailureLevel,
                 Name,
+                Id,
                 snapshot.Failed,
                 snapshot.Total,
                 elapsedSeconds,

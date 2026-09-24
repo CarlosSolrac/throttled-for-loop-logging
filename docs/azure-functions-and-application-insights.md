@@ -1,0 +1,965 @@
+# Context across hosts: Azure Functions and Application Insights
+
+ThrottledLogging keeps everything in memory, inside one process. That is deliberate: it keeps the
+hot path cheap, and it never slows your loop down with I/O. It also means that nothing about an
+operation survives the process. When Azure Functions recycles a worker, scales out to more
+instances or retries a failed invocation, each run starts from zero, with a new operation id,
+counts from 0 and no ETA history.
+
+What *does* survive is whatever the host and the trigger know about the run: a message id, a
+delivery count, a Durable instance id, a trace id. This guide shows how to put those on every line
+the library writes, so that a Kusto query can stitch the runs back together afterwards.
+
+Nothing here needs Azure. The library depends only on `Microsoft.Extensions.Logging`
+abstractions, and everything below works the same with any logging provider; Application
+Insights is simply the one that stores the context most usefully.
+
+- [What reaches every line](#what-reaches-every-line)
+- [What survives a restart, by trigger](#what-survives-a-restart-by-trigger)
+- [Wiring up the worker](#wiring-up-the-worker)
+- [One helper for every trigger](#one-helper-for-every-trigger)
+- [Storage queue](#storage-queue)
+- [Service Bus](#service-bus)
+- [Timer](#timer)
+- [Durable Functions](#durable-functions)
+- [Without Azure](#without-azure)
+- [Reading it back in Application Insights](#reading-it-back-in-application-insights)
+- [Things to know](#things-to-know)
+
+## What reaches every line
+
+Since 0.2.0 three things carry context onto the lines the library writes:
+
+| Mechanism | What it carries | Where it applies |
+|---|---|---|
+| **The caller's own logging scope and `Activity`** | Whatever you opened with `ILogger.BeginScope` before calling `BeginOperation`, and `Activity.Current` (which Application Insights uses as `operation_Id`) | Every line. Lines written on your thread have them anyway; the operation also captures them at `BeginOperation` and restores them for the heartbeat lines written by the background sweeper and for the shutdown flush |
+| **`OperationOptions.Scope`** | Key/value pairs you hand to one operation | Every line that operation writes, and only those |
+| **`OperationId`** | The operation's own `Guid` | Every line, as a structured field and in the message text |
+
+Use the first when your own lines should carry the same context, which in a function is almost
+always the case. Use `OperationOptions.Scope` when there is no outer scope to open, such as a
+console job that logs only through the library. Don't put the same keys in both: a text sink with
+scopes enabled would print them twice. Application Insights doesn't mind, because repeated keys
+just overwrite each other.
+
+When the host shuts down, disposing `OperationLogger` writes out every operation still running:
+its held events, then one line (event id **9008**) saying it was still running, with the counts it
+had reached. If that is an operation's last line, the process died before the operation finished.
+
+## What survives a restart, by trigger
+
+| Trigger | BusinessKey (stable across retries) | Attempt | Also worth logging |
+|---|---|---|---|
+| Storage queue | `QueueMessage.MessageId` | `DequeueCount` | `InsertedOn` |
+| Service Bus | `ServiceBusReceivedMessage.MessageId` | `DeliveryCount` | `CorrelationId`, `SequenceNumber`, `EnqueuedTime`; the sender's trace context arrives with the message |
+| Timer | The data the run covers, e.g. the hour being imported | Always 1 | `IsPastDue`, `ScheduleStatus.Last`/`Next` (persisted by the host in storage) |
+| Durable Functions | The orchestration `InstanceId` | Not visible to an activity | Chunk index; progress itself survives, because each activity is checkpointed |
+
+Every trigger also has an `InvocationId`, which is new on every run, and runs on a host instance
+(`WEBSITE_INSTANCE_ID`, shown as `cloud_RoleInstance`). Neither survives a restart, and that is
+exactly what makes them useful: a change of `InvocationId` under one BusinessKey marks a retry,
+and a change of process id marks a recycle.
+
+Don't read Application Insights at runtime to recover context. Ingestion lags by minutes, and it
+is a query store, not a state store. Treat it as the place to look afterwards.
+
+## Wiring up the worker
+
+For the .NET isolated worker. The in-process model reaches end of support in November 2026. The
+examples were compiled against these packages:
+
+| Package | Version |
+|---|---|
+| `Microsoft.Azure.Functions.Worker` | 2.52.0 |
+| `Microsoft.Azure.Functions.Worker.Sdk` | 2.1.0 |
+| `Microsoft.Azure.Functions.Worker.ApplicationInsights` | 2.51.0 |
+| `Microsoft.ApplicationInsights.WorkerService` | 2.23.0 |
+| `Microsoft.Azure.Functions.Worker.Extensions.Storage.Queues` | 5.5.5 |
+| `Microsoft.Azure.Functions.Worker.Extensions.ServiceBus` | 5.24.0 |
+| `Microsoft.Azure.Functions.Worker.Extensions.Timer` | 4.3.1 |
+| `Microsoft.Azure.Functions.Worker.Extensions.DurableTask` | 1.19.1 |
+| `ThrottledForLoopLogging` | 0.2.0-alpha |
+
+`Microsoft.ApplicationInsights.WorkerService` stays on 2.x on purpose. The worker's Application
+Insights package depends on the 2.x SDK, and 3.x is a different, OpenTelemetry-based SDK. If you
+move to OpenTelemetry, set `IncludeScopes = true` on its logging options, because scopes are off by
+default there.
+
+`Program.cs`:
+
+```csharp
+using Examples;
+using Microsoft.ApplicationInsights;
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Azure.Functions.Worker.Builder;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.ApplicationInsights;
+using ThrottledLogging;
+
+FunctionsApplicationBuilder builder = FunctionsApplication.CreateBuilder(args);
+
+// 1. Send the worker's own ILogger output to Application Insights directly. Without these two
+//    calls, logs travel to the Functions host over gRPC and are re-logged there, which keeps the
+//    message and level but drops the logging scopes. The scopes are the whole point here: they
+//    carry BusinessKey, Attempt and InvocationId into customDimensions.
+builder.Services
+    .AddApplicationInsightsTelemetryWorkerService()
+    .ConfigureFunctionsApplicationInsights();
+
+// 2. Scopes become customDimensions only when the provider includes them. It does by default in
+//    Microsoft.ApplicationInsights.WorkerService 2.x; saying so explicitly guards against a change.
+builder.Logging.Services.Configure<ApplicationInsightsLoggerOptions>(options => options.IncludeScopes = true);
+
+// 3. The Application Insights SDK adds a filter rule that drops everything below Warning. Remove
+//    it, or every Information line this library writes (entry, progress, success) disappears and
+//    only failures reach the portal. Levels are then governed by host.json / appsettings as usual.
+builder.Logging.Services.Configure<LoggerFilterOptions>(options =>
+{
+    LoggerFilterRule? defaultRule = options.Rules.FirstOrDefault(rule =>
+        rule.ProviderName == "Microsoft.Extensions.Logging.ApplicationInsights.ApplicationInsightsLoggerProvider");
+    if (defaultRule is not null)
+    {
+        options.Rules.Remove(defaultRule);
+    }
+});
+
+// 4. The library itself. These defaults suit a loop of tens of thousands of short items; a
+//    function can still override them per operation (start from DefaultOptions, see below).
+builder.Services.AddThrottledLogging(options =>
+{
+    options.Defaults.EveryItems = 1_000;
+    options.Defaults.EveryInterval = TimeSpan.FromSeconds(30);
+    options.Defaults.FailureEveryItems = 100;
+    options.Defaults.FailureEveryInterval = TimeSpan.FromSeconds(10);
+});
+
+// Stand-in for your data access. Replace with whatever the functions really read and write.
+builder.Services.AddSingleton<IOrderStore, InMemoryOrderStore>();
+
+IHost host = builder.Build();
+
+// 5. Shutdown, in the right order. When the platform recycles or scales in, the host signals
+//    ApplicationStopping first and disposes services last. By the time the container disposes
+//    OperationLogger, Application Insights may already have stopped sending. So:
+//    - on ApplicationStopping, dispose OperationLogger early. That writes every running
+//      operation's held events plus one "still running" line (event 9008) while telemetry is
+//      still flowing. The operations themselves keep working; a function that finishes during
+//      the drain still logs its normal end line afterwards.
+//    - on ApplicationStopped, flush the telemetry channel so those lines leave the machine.
+IHostApplicationLifetime lifetime = host.Services.GetRequiredService<IHostApplicationLifetime>();
+OperationLogger operationLogger = host.Services.GetRequiredService<OperationLogger>();
+TelemetryClient telemetry = host.Services.GetRequiredService<TelemetryClient>();
+lifetime.ApplicationStopping.Register(operationLogger.Dispose);
+lifetime.ApplicationStopped.Register(() => telemetry.FlushAsync(CancellationToken.None).GetAwaiter().GetResult());
+
+host.Run();
+```
+
+Two lines in there are easy to leave out. If the worker doesn't send its own telemetry
+(`AddApplicationInsightsTelemetryWorkerService` plus `ConfigureFunctionsApplicationInsights`), logs
+reach Application Insights through the Functions host, which keeps the message and drops the
+scopes. If the default filter rule stays, nothing below `Warning` arrives at all.
+
+The examples below stand in for real data access with a small interface. Swap it for your own:
+
+```csharp
+namespace Examples;
+
+/// <summary>One unit of work inside a batch.</summary>
+/// <param name="Id">The order's identifier; used as the item label in the log.</param>
+/// <param name="Payload">Whatever processing needs.</param>
+public sealed record Order(string Id, string Payload);
+
+/// <summary>Stand-in for the app's data access, so the examples compile on their own.</summary>
+public interface IOrderStore
+{
+    /// <summary>Counts the orders in a batch, so the operation can report an ETA.</summary>
+    Task<long> CountAsync(string batchId, CancellationToken cancellationToken);
+
+    /// <summary>Streams a batch's orders.</summary>
+    IAsyncEnumerable<Order> ReadAsync(string batchId, CancellationToken cancellationToken);
+
+    /// <summary>Processes one order. Throws when it fails.</summary>
+    Task ProcessAsync(Order order, CancellationToken cancellationToken);
+}
+
+/// <summary>A trivial implementation for local runs.</summary>
+public sealed class InMemoryOrderStore : IOrderStore
+{
+    /// <inheritdoc />
+    public Task<long> CountAsync(string batchId, CancellationToken cancellationToken) => Task.FromResult(1_000L);
+
+    /// <inheritdoc />
+    public async IAsyncEnumerable<Order> ReadAsync(string batchId, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        for (int i = 0; i < 1_000; i++)
+        {
+            await Task.Yield();
+            yield return new Order($"{batchId}-{i}", string.Empty);
+        }
+    }
+
+    /// <inheritdoc />
+    public Task ProcessAsync(Order order, CancellationToken cancellationToken) => Task.CompletedTask;
+}
+```
+
+## One helper for every trigger
+
+Each function builds the same set of fields and opens them as a scope before it begins the
+operation. That way one Kusto query works whatever trigger started the run.
+
+```csharp
+using System.Diagnostics;
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Extensions.Logging;
+
+namespace Examples;
+
+/// <summary>
+/// Builds the one set of key/value pairs every function in this app attaches to its logs, so that
+/// the same Kusto query works whichever trigger started the run.
+/// </summary>
+/// <remarks>
+/// Each field answers one question someone asks when reading the log after an incident:
+/// <list type="table">
+///   <item><term>BusinessKey</term><description>Which piece of work was this? Stable across retries, restarts and instances. The field to search by.</description></item>
+///   <item><term>Attempt</term><description>How many times has that work been tried? 1 on the first delivery.</description></item>
+///   <item><term>Trigger</term><description>What started it: Queue, ServiceBus, Timer or Durable.</description></item>
+///   <item><term>InvocationId</term><description>Which single execution? New on every run, retries included.</description></item>
+///   <item><term>FunctionName</term><description>Which function? Useful when several share one work item.</description></item>
+///   <item><term>HostInstance</term><description>Which machine? The same value Application Insights shows as cloud_RoleInstance.</description></item>
+///   <item><term>ProcessId / ProcessStartedUtc</term><description>Which worker process? A change between two lines of one BusinessKey means the process was recycled in between.</description></item>
+///   <item><term>TraceId</term><description>The W3C trace id; equals operation_Id in Application Insights, and links producer and consumer when the trigger propagates it.</description></item>
+/// </list>
+/// </remarks>
+public static class InvocationContext
+{
+    // Read once: neither can change while the process lives.
+    private static readonly string HostInstance = Environment.GetEnvironmentVariable("WEBSITE_INSTANCE_ID") ?? Environment.MachineName;
+    private static readonly DateTimeOffset ProcessStartedUtc = new(Process.GetCurrentProcess().StartTime.ToUniversalTime(), TimeSpan.Zero);
+
+    /// <summary>Creates the pairs for one invocation.</summary>
+    /// <param name="context">The worker's per-invocation context.</param>
+    /// <param name="trigger">A short name for the trigger type.</param>
+    /// <param name="businessKey">What identifies the work across retries: a message id, a batch id, a Durable instance id.</param>
+    /// <param name="attempt">Which delivery of that work this is, counting from 1.</param>
+    /// <returns>A new dictionary; the caller may add fields specific to its trigger.</returns>
+    public static Dictionary<string, object?> Create(FunctionContext context, string trigger, string businessKey, long attempt)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+
+        return new Dictionary<string, object?>(StringComparer.Ordinal)
+        {
+            ["BusinessKey"] = businessKey,
+            ["Attempt"] = attempt,
+            ["Trigger"] = trigger,
+            ["InvocationId"] = context.InvocationId,
+            ["FunctionName"] = context.FunctionDefinition.Name,
+            ["HostInstance"] = HostInstance,
+            ["ProcessId"] = Environment.ProcessId,
+            ["ProcessStartedUtc"] = ProcessStartedUtc,
+            // Activity.Current is the invocation's activity when Application Insights is wired up in
+            // the worker; the trace context from the host is the fallback.
+            ["TraceId"] = Activity.Current?.TraceId.ToString() ?? context.TraceContext.TraceParent,
+        };
+    }
+
+    /// <summary>
+    /// Opens the pairs as a logging scope. Everything logged inside it, by the function and by
+    /// ThrottledLogging (including the background heartbeat, which restores the scope captured at
+    /// BeginOperation), carries them.
+    /// </summary>
+    /// <param name="logger">Any logger from the app's factory; scopes are shared across categories.</param>
+    /// <param name="pairs">From <see cref="Create"/>.</param>
+    /// <returns>The scope; dispose it when the invocation ends.</returns>
+    public static IDisposable? BeginInvocationScope(this ILogger logger, IReadOnlyDictionary<string, object?> pairs)
+    {
+        ArgumentNullException.ThrowIfNull(logger);
+        return logger.BeginScope(pairs);
+    }
+}
+```
+
+## Storage queue
+
+The simplest pattern. The message is the durable part: its `MessageId` holds steady across
+redeliveries and `DequeueCount` counts them.
+
+```csharp
+using Azure.Storage.Queues.Models;
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Extensions.Logging;
+using ThrottledLogging;
+
+namespace Examples;
+
+/// <summary>
+/// Storage queue trigger: one message names a batch, and the function works through every order in it.
+/// </summary>
+/// <remarks>
+/// What survives a restart here is the message. Its <c>MessageId</c> stays the same on every
+/// redelivery and its <c>DequeueCount</c> goes up, so BusinessKey = MessageId and
+/// Attempt = DequeueCount group every try of the same batch together, on any instance.
+/// Watch the visibility timeout: if the loop outlives it, the message becomes visible again and a
+/// second instance starts the same batch while the first is still running. Both runs then log
+/// under one BusinessKey with different InvocationIds and the same Attempt number.
+/// </remarks>
+public sealed class QueueImport
+{
+    private readonly IOperationLogger _operations;
+    private readonly IOrderStore _orders;
+    private readonly ILogger<QueueImport> _logger;
+
+    /// <summary>Created by the worker through dependency injection.</summary>
+    public QueueImport(IOperationLogger operations, IOrderStore orders, ILogger<QueueImport> logger)
+    {
+        _operations = operations;
+        _orders = orders;
+        _logger = logger;
+    }
+
+    /// <summary>Imports the batch the message names.</summary>
+    /// <param name="message">The raw queue message, bound as <see cref="QueueMessage"/> for its metadata. Its body is the batch id.</param>
+    /// <param name="context">The invocation.</param>
+    /// <param name="cancellationToken">Signalled when the host is shutting down.</param>
+    [Function(nameof(QueueImport))]
+    public async Task RunAsync([QueueTrigger("order-batches")] QueueMessage message, FunctionContext context, CancellationToken cancellationToken)
+    {
+        string batchId = message.Body.ToString();
+
+        // Everything that identifies this run, opened once for the whole invocation.
+        Dictionary<string, object?> pairs = InvocationContext.Create(context, "Queue", businessKey: message.MessageId, attempt: message.DequeueCount);
+        pairs["BatchId"] = batchId;
+        pairs["EnqueuedUtc"] = message.InsertedOn;
+        using IDisposable? scope = _logger.BeginInvocationScope(pairs);
+
+        if (message.DequeueCount > 1)
+        {
+            // Not throttled, and it should not be: this line is what tells a reader the previous
+            // attempt did not finish, whatever its own log says.
+            _logger.LogWarning("Batch {BatchId} is being retried, attempt {Attempt}", batchId, message.DequeueCount);
+        }
+
+        // Start from the configured defaults and change only what differs; a fresh
+        // OperationOptions would silently discard what Program.cs configured.
+        OperationOptions options = _operations.DefaultOptions;
+        options.TotalItems = await _orders.CountAsync(batchId, cancellationToken);
+
+        // BeginOperation runs inside the scope, so the operation captures it: every line the
+        // operation writes, including heartbeats from the background sweeper thread, carries
+        // BusinessKey, Attempt and InvocationId as customDimensions.
+        using IOperationScope operation = _operations.BeginOperation("ImportOrders", options);
+        try
+        {
+            await foreach (Order order in _orders.ReadAsync(batchId, cancellationToken))
+            {
+                using IItemScope item = operation.BeginItem(order.Id);
+                try
+                {
+                    await _orders.ProcessAsync(order, cancellationToken);
+                    item.Success();
+                }
+                catch (Exception error) when (error is not OperationCanceledException)
+                {
+                    // One bad order does not fail the batch. The failure channel throttles these on
+                    // its own, so 50,000 bad orders still produce a readable log.
+                    item.Failure(error);
+                }
+            }
+
+            operation.Success($"batch {batchId}");
+        }
+        catch (Exception error)
+        {
+            // Includes cancellation at shutdown. The message is not deleted, so it will be
+            // redelivered with DequeueCount + 1 and the next attempt's lines join this one's
+            // under the same BusinessKey.
+            operation.Failure(error);
+            throw;
+        }
+    }
+}
+```
+
+## Service Bus
+
+The same shape, with two additions: the lock has to be renewed while a long batch runs, and the
+sender's trace context comes along, so the sender's request and this function's lines share one
+`operation_Id` in Application Insights.
+
+```csharp
+using Azure.Messaging.ServiceBus;
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Extensions.Logging;
+using ThrottledLogging;
+
+namespace Examples;
+
+/// <summary>
+/// Service Bus trigger with manual settlement: the function completes the message itself, and
+/// renews its lock while a long batch runs.
+/// </summary>
+/// <remarks>
+/// Service Bus gives the best context of the four triggers. <c>MessageId</c> is stable across
+/// redeliveries and <c>DeliveryCount</c> counts them, like a storage queue. On top of that the
+/// sender's trace context travels with the message, so Application Insights puts the sender's
+/// request and this function's logs under one operation_Id, and <c>CorrelationId</c> carries
+/// whatever the sender chose to put there.
+/// </remarks>
+public sealed class ServiceBusImport
+{
+    // Renew well before the lock's default five-minute duration runs out.
+    private static readonly TimeSpan LockRenewalInterval = TimeSpan.FromMinutes(2);
+
+    private readonly IOperationLogger _operations;
+    private readonly IOrderStore _orders;
+    private readonly ILogger<ServiceBusImport> _logger;
+
+    /// <summary>Created by the worker through dependency injection.</summary>
+    public ServiceBusImport(IOperationLogger operations, IOrderStore orders, ILogger<ServiceBusImport> logger)
+    {
+        _operations = operations;
+        _orders = orders;
+        _logger = logger;
+    }
+
+    /// <summary>Imports the batch the message names, then completes the message.</summary>
+    /// <param name="message">The received message, bound whole for its metadata.</param>
+    /// <param name="actions">Settlement and lock renewal for that message.</param>
+    /// <param name="context">The invocation.</param>
+    /// <param name="cancellationToken">Signalled when the host is shutting down.</param>
+    [Function(nameof(ServiceBusImport))]
+    public async Task RunAsync(
+        [ServiceBusTrigger("order-batches", Connection = "ServiceBus", AutoCompleteMessages = false)] ServiceBusReceivedMessage message,
+        ServiceBusMessageActions actions,
+        FunctionContext context,
+        CancellationToken cancellationToken)
+    {
+        string batchId = message.Body.ToString();
+
+        Dictionary<string, object?> pairs = InvocationContext.Create(context, "ServiceBus", businessKey: message.MessageId, attempt: message.DeliveryCount);
+        pairs["BatchId"] = batchId;
+        pairs["CorrelationId"] = message.CorrelationId;
+        pairs["SequenceNumber"] = message.SequenceNumber;
+        pairs["EnqueuedUtc"] = message.EnqueuedTime;
+        using IDisposable? scope = _logger.BeginInvocationScope(pairs);
+
+        OperationOptions options = _operations.DefaultOptions;
+        options.TotalItems = await _orders.CountAsync(batchId, cancellationToken);
+
+        using IOperationScope operation = _operations.BeginOperation("ImportOrders", options);
+        DateTimeOffset lockRenewedAt = DateTimeOffset.UtcNow;
+        try
+        {
+            await foreach (Order order in _orders.ReadAsync(batchId, cancellationToken))
+            {
+                using (IItemScope item = operation.BeginItem(order.Id))
+                {
+                    try
+                    {
+                        await _orders.ProcessAsync(order, cancellationToken);
+                        item.Success();
+                    }
+                    catch (Exception error) when (error is not OperationCanceledException)
+                    {
+                        item.Failure(error);
+                    }
+                }
+
+                // Losing the lock mid-batch would hand the message to another instance while this
+                // one is still working: two runs, one BusinessKey, same DeliveryCount.
+                if (DateTimeOffset.UtcNow - lockRenewedAt > LockRenewalInterval)
+                {
+                    await actions.RenewMessageLockAsync(message, cancellationToken);
+                    lockRenewedAt = DateTimeOffset.UtcNow;
+                }
+            }
+
+            operation.Success($"batch {batchId}");
+            await actions.CompleteMessageAsync(message, cancellationToken);
+        }
+        catch (Exception error)
+        {
+            operation.Failure(error);
+
+            // Abandon so the message is redelivered now with DeliveryCount + 1, rather than waiting
+            // for the lock to expire. After MaxDeliveryCount it goes to the dead-letter queue, and
+            // the log shows every attempt under one BusinessKey.
+            await actions.AbandonMessageAsync(message, cancellationToken: CancellationToken.None);
+            throw;
+        }
+    }
+}
+```
+
+## Timer
+
+A timer has no message, no delivery count and no redelivery. The stable key has to be the data
+the run covers. This example also shows the delegate form, `RunAsync`, in place of the explicit
+`try`/`catch`.
+
+```csharp
+using System.Globalization;
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Extensions.Logging;
+using ThrottledLogging;
+
+namespace Examples;
+
+/// <summary>
+/// Timer trigger: every hour, import the orders that arrived in the previous hour.
+/// </summary>
+/// <remarks>
+/// A timer has no message, so nothing counts attempts and nothing is redelivered: if the host
+/// restarts mid-run, that hour is simply not finished until something notices. The stable key is
+/// therefore the data the run covers, not the run itself. Naming the hour means a rerun of the
+/// same hour, whether by a catch-up after <c>IsPastDue</c> or by hand, shares its BusinessKey
+/// with the run that failed.
+/// </remarks>
+public sealed class TimerImport
+{
+    private readonly IOperationLogger _operations;
+    private readonly IOrderStore _orders;
+    private readonly ILogger<TimerImport> _logger;
+
+    /// <summary>Created by the worker through dependency injection.</summary>
+    public TimerImport(IOperationLogger operations, IOrderStore orders, ILogger<TimerImport> logger)
+    {
+        _operations = operations;
+        _orders = orders;
+        _logger = logger;
+    }
+
+    /// <summary>Imports the previous hour's orders.</summary>
+    /// <param name="timer">Schedule state, persisted by the host in storage between runs.</param>
+    /// <param name="context">The invocation.</param>
+    /// <param name="cancellationToken">Signalled when the host is shutting down.</param>
+    [Function(nameof(TimerImport))]
+    public async Task RunAsync([TimerTrigger("0 5 * * * *")] TimerInfo timer, FunctionContext context, CancellationToken cancellationToken)
+    {
+        // The hour being imported, e.g. "orders-2026-09-24T17". Stable however many times it is run.
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        DateTimeOffset hour = new DateTimeOffset(now.Year, now.Month, now.Day, now.Hour, 0, 0, TimeSpan.Zero).AddHours(-1);
+        string batchId = "orders-" + hour.ToString("yyyy-MM-dd'T'HH", CultureInfo.InvariantCulture);
+
+        // No delivery count exists for a timer, so Attempt is always 1. IsPastDue says the
+        // schedule was missed (the app was down, or a previous run overran), which is the closest
+        // a timer gets to "this is a retry".
+        Dictionary<string, object?> pairs = InvocationContext.Create(context, "Timer", businessKey: batchId, attempt: 1);
+        pairs["IsPastDue"] = timer.IsPastDue;
+        pairs["ScheduleLastUtc"] = timer.ScheduleStatus?.Last;
+        pairs["ScheduleNextUtc"] = timer.ScheduleStatus?.Next;
+        using IDisposable? scope = _logger.BeginInvocationScope(pairs);
+
+        OperationOptions options = _operations.DefaultOptions;
+        options.TotalItems = await _orders.CountAsync(batchId, cancellationToken);
+
+        // RunAsync (an extension on IOperationLogger) begins the operation, logs success when the
+        // delegate returns and failure when it throws, and ends it either way: the explicit
+        // try/catch of the queue example, with less to get wrong.
+        await _operations.RunAsync(
+            "ImportOrders",
+            async (operation, ct) =>
+            {
+                await foreach (Order order in _orders.ReadAsync(batchId, ct))
+                {
+                    using IItemScope item = operation.BeginItem(order.Id);
+                    try
+                    {
+                        await _orders.ProcessAsync(order, ct);
+                        item.Success();
+                    }
+                    catch (Exception error) when (error is not OperationCanceledException)
+                    {
+                        item.Failure(error);
+                    }
+                }
+            },
+            options,
+            cancellationToken);
+    }
+}
+```
+
+## Durable Functions
+
+The only pattern here where a restart doesn't lose progress. The orchestrator splits the batch,
+each chunk is an activity, and the framework checkpoints each completed activity. The throttled
+operation lives in the activity. An orchestrator replays its code from the top, so an operation
+started there would log its entry line on every replay.
+
+```csharp
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.DurableTask;
+using Microsoft.DurableTask.Client;
+using Microsoft.Extensions.Logging;
+using ThrottledLogging;
+
+namespace Examples;
+
+/// <summary>What the orchestrator hands each activity.</summary>
+/// <param name="InstanceId">The orchestration's id. Activities cannot read it themselves, so it travels in the input.</param>
+/// <param name="BatchId">The batch being imported.</param>
+/// <param name="ChunkIndex">Which chunk, from 0.</param>
+/// <param name="ChunkCount">How many chunks the batch was split into.</param>
+/// <param name="OrderIds">The orders in this chunk.</param>
+public sealed record ChunkInput(string InstanceId, string BatchId, int ChunkIndex, int ChunkCount, IReadOnlyList<string> OrderIds);
+
+/// <summary>What each activity reports back.</summary>
+/// <param name="Processed">Orders that succeeded.</param>
+/// <param name="Failed">Orders that failed.</param>
+public sealed record ChunkResult(long Processed, long Failed);
+
+/// <summary>
+/// Durable Functions: an orchestrator splits a batch into chunks and runs one activity per chunk.
+/// </summary>
+/// <remarks>
+/// <para>
+/// This is the only one of the four patterns where a restart does not lose progress. Each
+/// completed activity is checkpointed; after a recycle the orchestrator replays, skips the chunks
+/// already done, and carries on. The InstanceId never changes, so it is the BusinessKey.
+/// </para>
+/// <para>
+/// ThrottledLogging belongs in the activity, never in the orchestrator. An orchestrator's code
+/// re-runs from the top on every replay, so an operation begun there would log its entry line
+/// again on every replay, and its ETA would measure replay speed rather than work. The
+/// orchestrator logs through <c>CreateReplaySafeLogger</c>, which drops lines during replay.
+/// </para>
+/// </remarks>
+public sealed class DurableImport
+{
+    private const int ChunkSize = 5_000;
+
+    private readonly IOperationLogger _operations;
+    private readonly IOrderStore _orders;
+    private readonly ILogger<DurableImport> _logger;
+
+    /// <summary>Created by the worker through dependency injection.</summary>
+    public DurableImport(IOperationLogger operations, IOrderStore orders, ILogger<DurableImport> logger)
+    {
+        _operations = operations;
+        _orders = orders;
+        _logger = logger;
+    }
+
+    /// <summary>Splits the batch and fans the chunks out, a few at a time.</summary>
+    /// <param name="context">The orchestration context; its InstanceId is stable for the whole run.</param>
+    /// <returns>Totals across every chunk.</returns>
+    [Function(nameof(ImportBatchOrchestrator))]
+    public async Task<ChunkResult> ImportBatchOrchestrator([OrchestrationTrigger] TaskOrchestrationContext context)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+
+        ILogger logger = context.CreateReplaySafeLogger<DurableImport>();
+        string batchId = context.GetInput<string>() ?? throw new InvalidOperationException("The orchestration needs a batch id as input.");
+
+        // Reading from storage is not deterministic, so it happens in an activity, and replay
+        // returns the recorded result instead of reading again.
+        IReadOnlyList<string> orderIds = await context.CallActivityAsync<IReadOnlyList<string>>(nameof(ListOrders), batchId);
+        List<ChunkInput> chunks = [];
+        int chunkCount = (orderIds.Count + ChunkSize - 1) / ChunkSize;
+        for (int index = 0; index < chunkCount; index++)
+        {
+            chunks.Add(new ChunkInput(context.InstanceId, batchId, index, chunkCount, [.. orderIds.Skip(index * ChunkSize).Take(ChunkSize)]));
+        }
+
+        // Replay-safe: written once, not once per replay. The scope makes it searchable by the
+        // same BusinessKey the activities use.
+        using (logger.BeginScope(new Dictionary<string, object?> { ["BusinessKey"] = context.InstanceId, ["Trigger"] = "Durable" }))
+        {
+            logger.LogInformation("Batch {BatchId} split into {ChunkCount} chunks of up to {ChunkSize}", batchId, chunkCount, ChunkSize);
+        }
+
+        // An activity that fails is retried by the framework, up to three times with back-off.
+        TaskOptions retry = TaskOptions.FromRetryPolicy(new RetryPolicy(maxNumberOfAttempts: 3, firstRetryInterval: TimeSpan.FromSeconds(10)));
+        ChunkResult[] results = await Task.WhenAll(chunks.Select(chunk => context.CallActivityAsync<ChunkResult>(nameof(ImportChunk), chunk, retry)));
+
+        return new ChunkResult(results.Sum(static r => r.Processed), results.Sum(static r => r.Failed));
+    }
+
+    /// <summary>Lists the batch's order ids.</summary>
+    /// <param name="batchId">The batch.</param>
+    /// <param name="context">The invocation.</param>
+    /// <returns>Every order id in the batch.</returns>
+    [Function(nameof(ListOrders))]
+    public async Task<IReadOnlyList<string>> ListOrders([ActivityTrigger] string batchId, FunctionContext context)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+
+        List<string> ids = [];
+        await foreach (Order order in _orders.ReadAsync(batchId, context.CancellationToken))
+        {
+            ids.Add(order.Id);
+        }
+
+        return ids;
+    }
+
+    /// <summary>Imports one chunk. This is where the throttled operation lives.</summary>
+    /// <param name="input">The chunk, with the orchestration's InstanceId.</param>
+    /// <param name="context">The invocation.</param>
+    /// <returns>This chunk's counts.</returns>
+    [Function(nameof(ImportChunk))]
+    public async Task<ChunkResult> ImportChunk([ActivityTrigger] ChunkInput input, FunctionContext context)
+    {
+        ArgumentNullException.ThrowIfNull(input);
+        ArgumentNullException.ThrowIfNull(context);
+
+        // An activity cannot see its retry count, so Attempt stays 1; a retried chunk shows up as a
+        // second operation with the same BusinessKey and ChunkIndex and a new InvocationId.
+        Dictionary<string, object?> pairs = InvocationContext.Create(context, "Durable", businessKey: input.InstanceId, attempt: 1);
+        pairs["BatchId"] = input.BatchId;
+        pairs["ChunkIndex"] = input.ChunkIndex;
+        pairs["ChunkCount"] = input.ChunkCount;
+        using IDisposable? scope = _logger.BeginInvocationScope(pairs);
+
+        OperationOptions options = _operations.DefaultOptions;
+        options.TotalItems = input.OrderIds.Count;
+
+        // The operation name includes the chunk so a single chunk's progress and ETA read on
+        // their own. Filter on BusinessKey to see the whole batch.
+        using IOperationScope operation = _operations.BeginOperation($"ImportOrders[{input.ChunkIndex + 1}/{input.ChunkCount}]", options);
+        long processed = 0;
+        long failed = 0;
+        try
+        {
+            foreach (string orderId in input.OrderIds)
+            {
+                using IItemScope item = operation.BeginItem(orderId);
+                try
+                {
+                    await _orders.ProcessAsync(new Order(orderId, string.Empty), context.CancellationToken);
+                    item.Success();
+                    processed++;
+                }
+                catch (Exception error) when (error is not OperationCanceledException)
+                {
+                    item.Failure(error);
+                    failed++;
+                }
+            }
+
+            operation.Success();
+            return new ChunkResult(processed, failed);
+        }
+        catch (Exception error)
+        {
+            operation.Failure(error);
+            throw;
+        }
+    }
+
+    /// <summary>Starts an import. The instance id is chosen here so a repeated request for the same batch finds the existing run.</summary>
+    /// <param name="batchId">The batch to import; the body of the queue message.</param>
+    /// <param name="client">The Durable client.</param>
+    /// <param name="context">The invocation.</param>
+    [Function(nameof(StartImport))]
+    public async Task StartImport([QueueTrigger("durable-order-batches")] string batchId, [DurableClient] DurableTaskClient client, FunctionContext context)
+    {
+        ArgumentNullException.ThrowIfNull(client);
+        ArgumentNullException.ThrowIfNull(context);
+
+        // A deterministic instance id makes the batch id the BusinessKey end to end.
+        string instanceId = "import-" + batchId;
+        OrchestrationMetadata? existing = await client.GetInstanceAsync(instanceId, context.CancellationToken);
+        if (existing is { IsRunning: true })
+        {
+            _logger.LogInformation("Import {InstanceId} is already running; not starting another", instanceId);
+            return;
+        }
+
+        await client.ScheduleNewOrchestrationInstanceAsync(nameof(ImportBatchOrchestrator), batchId, new StartOrchestrationOptions(instanceId), context.CancellationToken);
+    }
+}
+```
+
+## Without Azure
+
+Nothing above depends on Azure beyond the trigger bindings. The same library in a console job on
+the generic host, writing JSON lines with scopes to standard output:
+
+```csharp
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using ThrottledLogging;
+
+namespace Examples;
+
+/// <summary>
+/// The same idea with no Azure and no Application Insights: a console job on the generic host,
+/// logging JSON to standard output for whatever collects it (a container runtime, systemd, a file).
+/// </summary>
+public static class PlainHost
+{
+    /// <summary>Runs one import as a console job.</summary>
+    /// <param name="args">Command-line arguments; the first is the batch id.</param>
+    /// <returns>The process exit code.</returns>
+    public static async Task<int> RunAsync(string[] args)
+    {
+        ArgumentNullException.ThrowIfNull(args);
+
+        HostApplicationBuilder builder = Host.CreateApplicationBuilder(args);
+
+        // One JSON object per line, scopes included, so every field is queryable downstream.
+        builder.Logging.ClearProviders();
+        builder.Logging.AddJsonConsole(options => options.IncludeScopes = true);
+
+        builder.Services.AddThrottledLogging();
+        builder.Services.AddSingleton<IOrderStore, InMemoryOrderStore>();
+
+        using IHost host = builder.Build();
+        IOperationLogger operations = host.Services.GetRequiredService<IOperationLogger>();
+        IOrderStore orders = host.Services.GetRequiredService<IOrderStore>();
+
+        string batchId = args.Length > 0 ? args[0] : "batch-local";
+
+        // Without a host to supply an invocation id, the job supplies its own context. Putting it
+        // in OperationOptions.Scope rather than in an outer BeginScope attaches it to the
+        // library's lines only; use an outer scope instead when your own lines need it too.
+        OperationOptions options = operations.DefaultOptions;
+        options.TotalItems = await orders.CountAsync(batchId, CancellationToken.None);
+        options.Scope = new Dictionary<string, object?>
+        {
+            ["BusinessKey"] = batchId,
+            ["JobRunId"] = Guid.NewGuid(),
+            ["Machine"] = Environment.MachineName,
+        };
+
+        using IOperationScope operation = operations.BeginOperation("ImportOrders", options);
+        await foreach (Order order in orders.ReadAsync(batchId, CancellationToken.None))
+        {
+            using IItemScope item = operation.BeginItem(order.Id);
+            try
+            {
+                await orders.ProcessAsync(order, CancellationToken.None);
+                item.Success();
+            }
+            catch (InvalidOperationException error)
+            {
+                item.Failure(error);
+            }
+        }
+
+        operation.Success();
+
+        // Disposing the host disposes OperationLogger, which would flush anything still running.
+        // Here nothing is, because the operation has ended.
+        return 0;
+    }
+}
+```
+
+A line from that job, formatted for reading:
+
+```json
+{
+  "EventId": 9004,
+  "LogLevel": "Information",
+  "Category": "ThrottledLogging.ImportOrders",
+  "Message": "ImportOrders (3f0c…) item batch-local-499 Succeeded — 500/1000 done, 0 failed, new=True, …",
+  "State": { "OperationName": "ImportOrders", "OperationId": "3f0c…", "ItemLabel": "batch-local-499", "IsNew": true, "…": "…" },
+  "Scopes": [ { "Message": "BusinessKey:batch-local, JobRunId:9a1e…, Machine:build-01", "BusinessKey": "batch-local", "JobRunId": "9a1e…", "Machine": "build-01" } ]
+}
+```
+
+With a plain text sink, the scope prints as `=> BusinessKey:batch-local, JobRunId:…, Machine:…`
+when the sink's `IncludeScopes` is on. If a sink ignores scopes entirely, you still have
+`OperationId` on every line.
+
+## Reading it back in Application Insights
+
+Each structured field of a line becomes a `customDimensions` entry. That covers the library's own
+fields (`OperationId`, `ItemLabel`, `IsNew`, `Processed`, …) and every scope pair. `operation_Id`
+is the W3C trace id.
+
+**Every line for one piece of work, across retries, instances and recycles:**
+
+```kusto
+traces
+| where timestamp > ago(7d)
+| where tostring(customDimensions.BusinessKey) == "<message id, batch id or instance id>"
+| extend Attempt = toint(customDimensions.Attempt),
+         InvocationId = tostring(customDimensions.InvocationId),
+         OperationId = tostring(customDimensions.OperationId),
+         ProcessId = toint(customDimensions.ProcessId),
+         EventId = toint(customDimensions.EventId)
+| project timestamp, Attempt, cloud_RoleInstance, ProcessId, InvocationId, OperationId, EventId, severityLevel, message
+| order by timestamp asc
+```
+
+**Operations that never finished**, meaning no success, failure or incomplete line. The last line
+each one wrote shows how far it got, and `ShutDown` tells you whether the host saw it coming:
+
+```kusto
+traces
+| where timestamp > ago(1d)
+| extend OperationId = tostring(customDimensions.OperationId), EventId = toint(customDimensions.EventId)
+| where isnotempty(OperationId)
+| summarize Started = min(timestamp),
+            LastLine = max(timestamp),
+            Ended = countif(EventId in (9001, 9002, 9003)),
+            ShutDown = countif(EventId == 9008),
+            LastMessage = arg_max(timestamp, message),
+            BusinessKey = take_any(tostring(customDimensions.BusinessKey)),
+            Instance = take_any(cloud_RoleInstance)
+            by OperationId
+| where Ended == 0
+| order by LastLine desc
+```
+
+**Retries per piece of work, and how each attempt ended:**
+
+```kusto
+traces
+| where timestamp > ago(7d)
+| extend BusinessKey = tostring(customDimensions.BusinessKey),
+         Attempt = toint(customDimensions.Attempt),
+         EventId = toint(customDimensions.EventId)
+| where EventId in (9001, 9002, 9003, 9008)
+| summarize Outcome = make_list(pack("attempt", Attempt, "event", EventId, "at", timestamp)) by BusinessKey
+| where array_length(Outcome) > 1
+```
+
+**Progress of everything running now, from the latest progress line per operation:**
+
+```kusto
+traces
+| where timestamp > ago(1h)
+| extend EventId = toint(customDimensions.EventId)
+| where EventId == 9004
+| summarize arg_max(timestamp, *) by OperationId = tostring(customDimensions.OperationId)
+| project timestamp,
+          Operation = tostring(customDimensions.OperationName),
+          BusinessKey = tostring(customDimensions.BusinessKey),
+          Processed = tolong(customDimensions.Processed),
+          Total = tolong(customDimensions.TotalItems),
+          Failed = tolong(customDimensions.Failed),
+          EtaSeconds = todouble(customDimensions.EtaSeconds),
+          IsNew = tobool(customDimensions.IsNew)
+```
+
+A row whose `timestamp` keeps advancing while `IsNew` stays `false` is a loop that has stopped
+moving: the sweeper keeps resending the same held event as a heartbeat.
+
+## Things to know
+
+- **Context is captured at `BeginOperation`.** Open your scope *before* you call it. A scope
+  opened afterwards still reaches lines written on your own thread, but not the heartbeat lines
+  from the sweeper.
+- **The captured context lives as long as the operation.** It holds the caller's `AsyncLocal`
+  values, so anything large in them stays in memory until the operation ends. End operations
+  (`using` does it for you).
+- **A caller that suppresses execution-context flow** (`ExecutionContext.SuppressFlow`) captures
+  nothing. The heartbeat then carries only `OperationOptions.Scope` and the operation id, which is
+  how every line behaved before 0.2.0.
+- **The shutdown flush leaves operations open.** A function still draining after
+  `ApplicationStopping` can keep submitting items and will log its normal end line. The 9008 line
+  just records that shutdown began while it was running.
+- **Getting lines off the machine at shutdown is up to the provider.** Application Insights
+  buffers, which is why `Program.cs` flushes its channel on `ApplicationStopped`. A hard kill (out
+  of memory, a platform timeout) skips all of this, and the last throttled line is all you have.
+  The first query above is how you notice.

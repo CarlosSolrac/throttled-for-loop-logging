@@ -756,3 +756,21 @@ Two further notes from building it:
 - **The ETA warm-up gate is elapsed-time as well as sample-count.** Five completed items is not
   enough on its own; `EtaMinimumElapsed` (one second by default) must also have passed, or a loop
   of very fast items would publish an estimate built from nothing.
+
+## 13. Context and host lifetime (0.2.0)
+
+Nothing about an operation outlives its process, and that is still by design: persistence would
+put I/O on the hot path. 0.2.0 instead makes sure that the context a host *does* keep reaches every
+line, so runs can be joined up afterwards. Worked examples for Azure Functions and Application
+Insights are in [`../azure-functions-and-application-insights.md`](../azure-functions-and-application-insights.md).
+
+| Gap in 0.1.0 | 0.2.0 |
+|---|---|
+| Heartbeat lines from the sweeper thread lost the caller's logging scopes and `Activity`, so they had no invocation id and no `operation_Id` | `OperationScope` captures the `ExecutionContext` at `BeginOperation` and runs sweeps and the shutdown flush inside it. A caller that suppressed flow captures nothing, and those lines behave as before |
+| No way to attach context to the library's lines without an outer scope | `OperationOptions.Scope`: key/value pairs copied at `BeginOperation` and opened as a scope around each line, as an immutable list of pairs, so structured sinks see fields and text sinks see `Key:Value, …` |
+| Item (9004), failure (9005) and failure-summary (9006) lines named the operation but not its id, so two concurrent runs of one function could not be told apart | Every line carries `{OperationId}`. This changes the message text of those lines; the structured fields only gain one |
+| Disposing `OperationLogger` stopped the sweeper and dropped whatever was held | `Dispose` flushes every running operation's held events and writes event **9008** ("still running when the logger shut down") with its counts. The operation stays open, because a function may still be draining |
+
+The scope is opened per line rather than once per operation because logging scopes live in the
+ambient context of whichever thread writes, and an operation's lines come from several threads.
+

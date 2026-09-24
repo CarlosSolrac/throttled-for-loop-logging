@@ -153,7 +153,26 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
         };
     }
 
-    /// <summary>Stops the sweeper. Operations already handed out keep working and can still be ended.</summary>
+    /// <summary>
+    /// Stops the sweeper, then writes out every operation that is still running: its held events,
+    /// followed by one line (event id 9008) saying it was still running and how far it had got.
+    /// Operations already handed out keep working and can still be ended.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A dependency injection container disposes this singleton when the host stops, which is the
+    /// last moment the process is known to be alive. Without this, an Azure Functions recycle,
+    /// a scale-in or a Kubernetes pod eviction would leave an operation's log ending at whatever
+    /// happened to be its last throttled line, with the most recent events lost and no hint of
+    /// why the run stopped.
+    /// </para>
+    /// <para>
+    /// The container disposes in reverse order of creation, and this logger depends on the
+    /// <see cref="ILoggerFactory"/>, so the factory and its providers are still alive here. Whether
+    /// a provider then gets those lines off the machine before the process exits is up to the
+    /// provider: Application Insights buffers, and needs its channel flushed on shutdown.
+    /// </para>
+    /// </remarks>
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
@@ -173,6 +192,21 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
         }
 
         _shutdown.Dispose();
+
+        // After the sweeper has stopped, so the two cannot race to flush the same held event.
+        foreach (OperationScope scope in _active.Values)
+        {
+            try
+            {
+                scope.FlushForShutdown();
+            }
+#pragma warning disable CA1031 // One misbehaving logging provider must not stop the others being flushed, nor throw out of Dispose.
+            catch (Exception error)
+#pragma warning restore CA1031
+            {
+                Log.ShutdownFlushFailed(_selfLogger, error, scope.Name, scope.Id);
+            }
+        }
     }
 
     /// <summary>Runs one sweep across every active operation. Exposed so tests need no background timer.</summary>
