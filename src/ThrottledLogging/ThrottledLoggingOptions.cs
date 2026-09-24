@@ -11,7 +11,8 @@ public sealed class ThrottledLoggingOptions
     /// <summary>
     /// Whether the background sweeper runs. It flushes held events whose time threshold has
     /// elapsed while nothing is being submitted, so a stalled loop still produces a heartbeat.
-    /// One timer serves the whole process.
+    /// One timer serves the whole process. When settings come from configuration, changing this
+    /// starts or stops the sweeper without a restart.
     /// </summary>
     public bool EnableSweeper { get; set; } = true;
 

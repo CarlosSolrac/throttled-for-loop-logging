@@ -52,15 +52,14 @@ public sealed class DependencyInjectionTests
     [Fact]
     public void Configured_defaults_apply_to_operations_that_supply_none()
     {
-        using ServiceProvider provider = Build(static options =>
+        List<ThrottledEvent> emitted = [];
+        using ServiceProvider provider = Build(options =>
         {
             options.EnableSweeper = false;
             options.Defaults.EveryItems = 3;
             options.Defaults.EveryInterval = TimeSpan.FromHours(1);
+            options.OnEmitted = emitted.Add;
         });
-
-        List<ThrottledEvent> emitted = [];
-        provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<ThrottledLoggingOptions>>().Value.OnEmitted = emitted.Add;
 
         IOperationLogger logger = provider.GetRequiredService<IOperationLogger>();
         using IOperationScope operation = logger.BeginOperation("ImportOrders");

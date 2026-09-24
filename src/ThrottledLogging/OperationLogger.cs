@@ -11,13 +11,22 @@ namespace ThrottledLogging;
 public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDisposable
 {
     private readonly ILoggerFactory _loggerFactory;
-    private readonly ThrottledLoggingOptions _options;
     private readonly TimeProvider _time;
     private readonly ConcurrentDictionary<Guid, OperationScope> _active = new();
     private readonly ConcurrentDictionary<string, ILogger> _loggers = new(StringComparer.Ordinal);
-    private readonly CancellationTokenSource _shutdown = new();
-    private readonly Task? _sweeper;
     private readonly ILogger _selfLogger;
+    private readonly IDisposable? _reloadSubscription;
+
+    // Guards starting and stopping the sweeper, which a reload can do at any time.
+    private readonly object _sweeperGate = new();
+
+    // Replaced whole when configuration reloads; read with Volatile.Read through Current.
+    private Settings _settings;
+
+    // The running sweeper's stop signal, or null when it is off. _sweeper is the most recently
+    // started loop, which may still be finishing after being stopped.
+    private CancellationTokenSource? _sweeperStop;
+    private Task? _sweeper;
 
     private long _retiredEventsSubmitted;
     private long _retiredEventsLogged;
@@ -32,11 +41,42 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
     private long _failedOperations;
     private int _disposed;
 
-    /// <summary>Creates the logger for dependency injection.</summary>
+    /// <summary>
+    /// Creates the logger for dependency injection, following configuration as it changes. This is
+    /// the constructor <see cref="ThrottledLoggingServiceCollectionExtensions.AddThrottledLogging(Microsoft.Extensions.DependencyInjection.IServiceCollection, Action{ThrottledLoggingOptions})"/> uses.
+    /// </summary>
+    /// <param name="loggerFactory">Produces a logger per operation name, so operations can be filtered individually.</param>
+    /// <param name="options">Process-wide settings, and notice of their changes.</param>
+    /// <param name="timeProvider">The clock.</param>
+    /// <exception cref="ArgumentNullException">An argument is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">The initial settings are invalid.</exception>
+    /// <remarks>
+    /// A change applies to operations begun after it; each running operation keeps the settings it
+    /// began with. A change that fails validation is logged (event id 9011) and ignored, leaving
+    /// the last good settings in force.
+    /// </remarks>
+    public OperationLogger(ILoggerFactory loggerFactory, IOptionsMonitor<ThrottledLoggingOptions> options, TimeProvider timeProvider)
+        : this(loggerFactory, (options ?? throw new ArgumentNullException(nameof(options))).CurrentValue, timeProvider)
+    {
+        // The monitor reports changes to named instances too; only the unnamed one configures this.
+        _reloadSubscription = options.OnChange((changed, name) =>
+        {
+            if (string.IsNullOrEmpty(name))
+            {
+                Reload(changed);
+            }
+        });
+
+        // Catches a change that landed between reading CurrentValue above and subscribing.
+        Reload(options.CurrentValue);
+    }
+
+    /// <summary>Creates the logger for dependency injection, with settings fixed at startup.</summary>
     /// <param name="loggerFactory">Produces a logger per operation name, so operations can be filtered individually.</param>
     /// <param name="options">Process-wide settings.</param>
     /// <param name="timeProvider">The clock.</param>
     /// <exception cref="ArgumentNullException">An argument is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">The settings are invalid.</exception>
     public OperationLogger(ILoggerFactory loggerFactory, IOptions<ThrottledLoggingOptions> options, TimeProvider timeProvider)
         : this(loggerFactory, (options ?? throw new ArgumentNullException(nameof(options))).Value, timeProvider)
     {
@@ -44,32 +84,44 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
 
     /// <summary>Creates the logger without dependency injection.</summary>
     /// <param name="loggerFactory">Produces a logger per operation name.</param>
-    /// <param name="options">Process-wide settings; defaults are used when omitted.</param>
+    /// <param name="options">
+    /// Process-wide settings; defaults are used when omitted. They are copied here, so changing
+    /// this object afterwards has no effect.
+    /// </param>
     /// <param name="timeProvider">The clock; the system clock is used when omitted.</param>
     /// <exception cref="ArgumentNullException"><paramref name="loggerFactory"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">The settings are invalid.</exception>
     public OperationLogger(ILoggerFactory loggerFactory, ThrottledLoggingOptions? options = null, TimeProvider? timeProvider = null)
     {
         ArgumentNullException.ThrowIfNull(loggerFactory);
 
         _loggerFactory = loggerFactory;
-        _options = options ?? new ThrottledLoggingOptions();
         _time = timeProvider ?? TimeProvider.System;
         _selfLogger = loggerFactory.CreateLogger(typeof(OperationLogger).FullName!);
+        _settings = Settings.From(options ?? new ThrottledLoggingOptions());
 
-        _options.Defaults.Validate();
-
-        if (_options.EnableSweeper)
+        if (_settings.EnableSweeper)
         {
-            // Started with flow suppressed so the sweeper's thread inherits nothing from whoever
-            // happened to resolve this singleton first. Otherwise the first function invocation's
-            // scope and Activity would ride along on every heartbeat of every operation that did
-            // not capture its own context. Operations that did capture one are swept inside it.
-            _sweeper = CleanContext.Start(() => SweepLoopAsync(_shutdown.Token));
+            StartSweeper();
         }
     }
 
     /// <inheritdoc />
-    public OperationOptions DefaultOptions => _options.Defaults.Clone();
+    public OperationOptions DefaultOptions => Current.Defaults.Clone();
+
+    /// <summary>Whether the background sweeper is on. Exposed for tests.</summary>
+    internal bool IsSweeperRunning
+    {
+        get
+        {
+            lock (_sweeperGate)
+            {
+                return _sweeperStop is not null;
+            }
+        }
+    }
+
+    private Settings Current => Volatile.Read(ref _settings);
 
     /// <inheritdoc />
     public IOperationScope BeginOperation(string name, OperationOptions? options = null)
@@ -77,7 +129,7 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
         ArgumentNullException.ThrowIfNull(name);
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
-        OperationOptions effective = (options ?? _options.Defaults).Clone();
+        OperationOptions effective = (options ?? Current.Defaults).Clone();
         effective.Validate();
 
         ILogger logger = _loggers.GetOrAdd(name, static (key, factory) => factory.CreateLogger($"ThrottledLogging.{key}"), _loggerFactory);
@@ -195,12 +247,26 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
             return;
         }
 
-        _shutdown.Cancel();
+        // First, so no reload can start a sweeper after the one below has been stopped. Reload
+        // also checks _disposed under the sweeper gate, which covers a reload already under way.
+        IgnoreFailure(() => _reloadSubscription?.Dispose());
+
+        Task? sweeper;
+        CancellationTokenSource? stop;
+        lock (_sweeperGate)
+        {
+            sweeper = _sweeper;
+            stop = _sweeperStop;
+            _sweeperStop = null;
+            stop?.Cancel();
+        }
 
         bool sweeperStopped = true;
         try
         {
-            sweeperStopped = _sweeper?.Wait(TimeSpan.FromSeconds(5)) ?? true;
+            // A loop stopped by an earlier reload is awaited by any loop started after it, so the
+            // most recent one finishing means they all have.
+            sweeperStopped = sweeper?.Wait(TimeSpan.FromSeconds(5)) ?? true;
         }
         catch (AggregateException)
         {
@@ -218,7 +284,7 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
         }
         else
         {
-            _shutdown.Dispose();
+            stop?.Dispose();
         }
 
         foreach (OperationScope scope in _active.Values)
@@ -267,7 +333,7 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
     /// <param name="emitted">The event.</param>
     internal void NotifyEmitted(ThrottledEvent emitted)
     {
-        Action<ThrottledEvent>? observer = _options.OnEmitted;
+        Action<ThrottledEvent>? observer = Current.OnEmitted;
         if (observer is null)
         {
             return;
@@ -312,8 +378,90 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
         }
     }
 
-    private async Task SweepLoopAsync(CancellationToken cancellationToken)
+    /// <summary>
+    /// Applies reloaded settings: validated as a whole, then swapped in at once, so no reader ever
+    /// sees half of one version and half of another. Invalid settings are logged and ignored.
+    /// Runs on whatever thread raised the change, so it never waits on the sweeper.
+    /// </summary>
+    /// <param name="options">The new settings.</param>
+    private void Reload(ThrottledLoggingOptions options)
     {
+        Settings next;
+        try
+        {
+            next = Settings.From(options);
+        }
+        catch (ArgumentException error)
+        {
+            IgnoreFailure(() => Log.SettingsReloadRejected(_selfLogger, error));
+            return;
+        }
+
+        lock (_sweeperGate)
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                return;
+            }
+
+            Volatile.Write(ref _settings, next);
+            if (next.EnableSweeper)
+            {
+                StartSweeper();
+            }
+            else
+            {
+                StopSweeper();
+            }
+        }
+    }
+
+    /// <summary>Starts the sweeper unless it is already on. Called from the constructor, or under <see cref="_sweeperGate"/>.</summary>
+    private void StartSweeper()
+    {
+        if (_sweeperStop is not null)
+        {
+            return;
+        }
+
+        CancellationTokenSource stop = new();
+        Task? previous = _sweeper;
+        _sweeperStop = stop;
+
+        // Started with flow suppressed so the sweeper's thread inherits nothing from whoever
+        // happened to resolve this singleton first, or raised the reload. Otherwise the first
+        // function invocation's scope and Activity would ride along on every heartbeat of every
+        // operation that did not capture its own context. Operations that did capture one are
+        // swept inside it.
+        _sweeper = CleanContext.Start(() => SweepLoopAsync(previous, stop.Token));
+    }
+
+    /// <summary>Signals the sweeper to stop without waiting for it. Called under <see cref="_sweeperGate"/>.</summary>
+    private void StopSweeper()
+    {
+        if (_sweeperStop is not { } stop)
+        {
+            return;
+        }
+
+        _sweeperStop = null;
+        stop.Cancel();
+
+        // Disposed once the loop has let go of its token, which may be after a sweep in progress.
+        _sweeper?.ContinueWith(static (_, state) => ((CancellationTokenSource)state!).Dispose(), stop, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+    }
+
+    /// <param name="previous">A loop stopped by an earlier reload, which may still be mid-sweep.</param>
+    /// <param name="cancellationToken">Stops this loop.</param>
+    private async Task SweepLoopAsync(Task? previous, CancellationToken cancellationToken)
+    {
+        // Two loops sweeping at once could each write the same heartbeat, so a loop switched back
+        // on waits for the one switched off to finish its last sweep.
+        if (previous is not null)
+        {
+            await previous.ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+        }
+
         using PeriodicTimer timer = new(CurrentSweepInterval(), _time);
 
         try
@@ -332,14 +480,16 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
 
     /// <summary>
     /// A quarter of the tightest time threshold in play, so no held event waits much past its due
-    /// time, clamped so the timer neither spins nor sleeps through a short threshold.
+    /// time, clamped so the timer neither spins nor sleeps through a short threshold. Recomputed on
+    /// every tick, so reloaded intervals take effect from the next one.
     /// </summary>
     private TimeSpan CurrentSweepInterval()
     {
-        TimeSpan tightest = _options.Defaults.EveryInterval;
-        if (_options.Defaults.FailureEveryInterval < tightest)
+        Settings settings = Current;
+        TimeSpan tightest = settings.Defaults.EveryInterval;
+        if (settings.Defaults.FailureEveryInterval < tightest)
         {
-            tightest = _options.Defaults.FailureEveryInterval;
+            tightest = settings.Defaults.FailureEveryInterval;
         }
 
         foreach (OperationScope scope in _active.Values)
@@ -351,11 +501,66 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
         }
 
         TimeSpan quarter = tightest / 4;
-        if (quarter < _options.MinimumSweepInterval)
+        if (quarter < settings.MinimumSweepInterval)
         {
-            return _options.MinimumSweepInterval;
+            return settings.MinimumSweepInterval;
         }
 
-        return quarter > _options.MaximumSweepInterval ? _options.MaximumSweepInterval : quarter;
+        return quarter > settings.MaximumSweepInterval ? settings.MaximumSweepInterval : quarter;
+    }
+
+    /// <summary>
+    /// A validated, private copy of <see cref="ThrottledLoggingOptions"/>. Never changed once built:
+    /// a reload builds a new one and swaps it in, and nothing the caller does to the options object
+    /// afterwards reaches it.
+    /// </summary>
+    private sealed class Settings
+    {
+        private Settings(OperationOptions defaults, Action<ThrottledEvent>? onEmitted, bool enableSweeper, TimeSpan minimumSweepInterval, TimeSpan maximumSweepInterval)
+        {
+            Defaults = defaults;
+            OnEmitted = onEmitted;
+            EnableSweeper = enableSweeper;
+            MinimumSweepInterval = minimumSweepInterval;
+            MaximumSweepInterval = maximumSweepInterval;
+        }
+
+        /// <summary>Validated; handed out only as clones.</summary>
+        public OperationOptions Defaults { get; }
+
+        public Action<ThrottledEvent>? OnEmitted { get; }
+
+        public bool EnableSweeper { get; }
+
+        public TimeSpan MinimumSweepInterval { get; }
+
+        public TimeSpan MaximumSweepInterval { get; }
+
+        /// <summary>Copies and validates <paramref name="options"/>.</summary>
+        /// <param name="options">The settings.</param>
+        /// <returns>The copy.</returns>
+        /// <exception cref="ArgumentException">A setting is missing or out of range.</exception>
+        public static Settings From(ThrottledLoggingOptions options)
+        {
+            if (options.Defaults is null)
+            {
+                throw new ArgumentNullException(nameof(options), "Defaults must not be null.");
+            }
+
+            OperationOptions defaults = options.Defaults.Clone();
+            defaults.Validate();
+
+            if (options.MinimumSweepInterval <= TimeSpan.Zero)
+            {
+                throw new ArgumentOutOfRangeException(nameof(options), options.MinimumSweepInterval, "MinimumSweepInterval must be greater than zero.");
+            }
+
+            if (options.MaximumSweepInterval < options.MinimumSweepInterval)
+            {
+                throw new ArgumentOutOfRangeException(nameof(options), options.MaximumSweepInterval, "MaximumSweepInterval must not be less than MinimumSweepInterval.");
+            }
+
+            return new Settings(defaults, options.OnEmitted, options.EnableSweeper, options.MinimumSweepInterval, options.MaximumSweepInterval);
+        }
     }
 }

@@ -128,21 +128,20 @@ builder.Logging.Services.Configure<LoggerFilterOptions>(options =>
     }
 });
 
-// 4. The library itself. These defaults suit a loop of tens of thousands of short items; a
-//    function can still override them per operation (start from DefaultOptions, see below).
-builder.Services.AddThrottledLogging(options =>
-{
-    options.Defaults.EveryItems = 1_000;
-    options.Defaults.EveryInterval = TimeSpan.FromSeconds(30);
-    options.Defaults.FailureEveryItems = 100;
-    options.Defaults.FailureEveryInterval = TimeSpan.FromSeconds(10);
-});
+// 4. The library itself, with its settings in the "ThrottledLogging" section of configuration
+//    (appsettings.json below, or app settings such as ThrottledLogging__Defaults__EveryItems).
+//    A function can still override them per operation (start from DefaultOptions, see below).
+//    The binding is read when OperationLogger is first resolved, so adding the JSON file after
+//    this line is fine.
+builder.Services.AddThrottledLogging(builder.Configuration.GetSection("ThrottledLogging"));
 
 // Stand-in for your data access. Replace with whatever the functions really read and write.
 builder.Services.AddSingleton<IOrderStore, InMemoryOrderStore>();
 
-// The worker reads appsettings.json only if asked to. Without this, a "Logging" section there has no effect.
-builder.Configuration.AddJsonFile("appsettings.json", optional: true, reloadOnChange: false);
+// The worker reads appsettings.json only if asked to. Without this, a "Logging" or
+// "ThrottledLogging" section there has no effect. reloadOnChange lets a changed file reach the
+// library without a restart; see "Changing settings without a restart" below.
+builder.Configuration.AddJsonFile("appsettings.json", optional: true, reloadOnChange: true);
 
 IHost host = builder.Build();
 
@@ -169,6 +168,49 @@ Two lines in there are easy to leave out. If the worker doesn't send its own tel
 (`AddApplicationInsightsTelemetryWorkerService` plus `ConfigureFunctionsApplicationInsights`), logs
 reach Application Insights through the Functions host, which keeps the message and drops the
 scopes. If the default filter rule stays, nothing below `Warning` arrives at all.
+
+`appsettings.json`, with these defaults suiting a loop of tens of thousands of short items. Every
+key is optional; anything left out keeps the library's default. Time spans use `hh:mm:ss`.
+
+```json
+{
+  "ThrottledLogging": {
+    "EnableSweeper": true,
+    "MinimumSweepInterval": "00:00:01",
+    "MaximumSweepInterval": "00:00:30",
+    "Defaults": {
+      "EveryItems": 1000,
+      "EveryInterval": "00:00:30",
+      "Level": "Information",
+      "FailureEveryItems": 100,
+      "FailureEveryInterval": "00:00:10",
+      "FailureLevel": "Warning"
+    }
+  }
+}
+```
+
+Mark the file `CopyToOutputDirectory` = `PreserveNewest` in the project, or the worker never sees
+it. `OnEmitted` is a delegate and cannot come from configuration; pass it in code as the second
+argument, `AddThrottledLogging(section, options => options.OnEmitted = ...)`, which is re-applied
+after every reload.
+
+### Changing settings without a restart
+
+When configuration changes (a reloaded file, a refreshed Azure App Configuration provider, a
+mounted Kubernetes ConfigMap):
+
+- **Operations begun afterwards** use the new defaults. **Operations already running** keep the
+  settings they began with, so a loop's thresholds never shift halfway through it.
+- **`EnableSweeper`** starts or stops the sweeper. **Sweep intervals** take effect from the
+  sweeper's next tick.
+- **Invalid settings** (say `EveryItems: 0`, or a maximum sweep interval below the minimum) are
+  rejected as a whole: the library logs event 9011 at `Warning` with the reason, and the last good
+  settings stay in force. Settings invalid at startup still throw, when `OperationLogger` is first
+  resolved.
+
+In Azure Functions, changing an app setting in the portal restarts the worker anyway, so reload
+matters mostly where configuration changes underneath a running process.
 
 The examples below stand in for real data access with a small interface. Swap it for your own:
 
@@ -1114,7 +1156,20 @@ for long runs.
   anything that parses the rendered text or matches on `{OriginalFormat}`. The structured
   properties only gained `OperationId`, and every event id is unchanged.
 - **New events:** 9008 (still running at shutdown, Warning), 9009 (a shutdown flush failed,
-  Warning), 9010 (the sweeper did not stop within five seconds, Warning).
-- **New API:** `OperationOptions.Scope`. Nothing was removed and no default changed.
+  Warning), 9010 (the sweeper did not stop within five seconds, Warning), 9011 (reloaded settings
+  were rejected, Warning).
+- **New API:** `OperationOptions.Scope`; `AddThrottledLogging(IConfiguration, Action<ThrottledLoggingOptions>?)`
+  to bind settings from configuration and follow reloads; an `OperationLogger` constructor taking
+  `IOptionsMonitor<ThrottledLoggingOptions>`. Nothing was removed and no default changed.
+- **New dependency:** `Microsoft.Extensions.Options.ConfigurationExtensions` 8.0.0 or later, for
+  the binding overload.
+- **Settings are copied when `OperationLogger` is built.** Changing a `ThrottledLoggingOptions`
+  object after handing it to the constructor, or `IOptions<ThrottledLoggingOptions>.Value` after
+  the container is built, no longer reaches the logger. Set everything, `OnEmitted` included, in
+  the configure delegate or in configuration. `AddThrottledLogging` now builds the logger from
+  `IOptionsMonitor`, so a registered configuration change does reach it, as described above.
+- **Sweep intervals are validated:** `MinimumSweepInterval` must be greater than zero and
+  `MaximumSweepInterval` at least as large. Invalid values throw when the logger is built; before,
+  they were accepted, and a zero maximum silently stopped the sweeper.
 - **Behaviour at shutdown:** disposing `OperationLogger` now writes lines where it used to write
   none.

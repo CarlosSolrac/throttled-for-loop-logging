@@ -101,6 +101,11 @@ internal static partial class Log
     [LoggerMessage(EventId = 9010, Level = LogLevel.Warning, Message = "The ThrottledLogging sweeper did not stop within five seconds; flushing running operations anyway.")]
     public static partial void SweeperDidNotStop(ILogger logger);
 
+    // Written when configuration reloads with settings that fail validation. The previous settings
+    // stay in force; the exception says which value was rejected.
+    [LoggerMessage(EventId = 9011, Level = LogLevel.Warning, Message = "Reloaded ThrottledLogging settings were rejected; the previous settings stay in force.")]
+    public static partial void SettingsReloadRejected(ILogger logger, Exception error);
+
     [LoggerMessage(EventId = 9007, Level = LogLevel.Debug, Message = "A ThrottledLogging observer threw and was ignored.")]
     public static partial void ObserverThrew(ILogger logger, Exception error);
 }

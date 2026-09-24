@@ -62,6 +62,26 @@ services.AddThrottledLogging(options =>
 });
 ```
 
+Or read the settings from configuration, such as `appsettings.json`:
+
+```csharp
+services.AddThrottledLogging(configuration.GetSection("ThrottledLogging"));
+```
+
+```json
+{
+  "ThrottledLogging": {
+    "EnableSweeper": true,
+    "Defaults": { "EveryItems": 500, "EveryInterval": "00:00:10", "FailureLevel": "Warning" }
+  }
+}
+```
+
+When that configuration reloads (`reloadOnChange: true`, a refreshed configuration provider),
+operations begun afterwards use the new settings, running ones keep theirs, and `EnableSweeper`
+starts or stops the sweeper. Settings that fail validation are logged as event 9011 and ignored,
+so the last good ones stay in force.
+
 And ask what is running, from anywhere, at any time:
 
 ```csharp

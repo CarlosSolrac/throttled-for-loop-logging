@@ -649,7 +649,10 @@ services.AddThrottledLogging(options =>
 });
 ```
 
-Bindable from `IConfiguration`. `ThrottledLoggingOptions` also carries an `OnEmitted` observer,
+Bindable from `IConfiguration` with `AddThrottledLogging(section)`, and reloaded when it changes:
+the logger follows `IOptionsMonitor`, validates each new version whole, and swaps it in for
+operations begun afterwards; running operations keep their own copy, and a version that fails
+validation is logged (9011) and ignored. `ThrottledLoggingOptions` also carries an `OnEmitted` observer,
 called with every event that survives throttling, for pushing the same data to metrics and for
 asserting on structure in tests rather than parsing log text.
 
