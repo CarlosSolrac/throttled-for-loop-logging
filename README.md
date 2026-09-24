@@ -89,18 +89,21 @@ foreach (OperationSnapshot op in await registry.GetActiveOperationsAsync(ct))
 ## Layout
 
 ```
-src/ThrottledLogging               the library        (net8.0; net10.0)
-tests/ThrottledLogging.Tests       xUnit v3 tests     (net10.0)
-samples/ThrottledLogging.Sample    a runnable tour    (net10.0)
-docs/design                        the design document and its reasoning
-tools/ReadmeAnimation              regenerates the animation above (net10.0)
+src/ThrottledLogging                  the library         (net8.0; net10.0)
+tests/ThrottledLogging.Tests          xUnit v3 tests      (net10.0)
+samples/ThrottledLogging.Sample       a runnable tour     (net10.0)
+samples/ThrottledLogging.RetrySample  loops that retry    (net10.0)
+docs/design                           the design document and its reasoning
+tools/ReadmeAnimation                 regenerates the animation above (net10.0)
 ```
 
 The animation is drawn from a real run: `dotnet run --project tools/ReadmeAnimation` puts a short
 scripted loop through the library on a fake clock and rewrites `docs/images/throttled-for-loop.svg`
 from what it submitted and what reached the logger.
 
-## Sample
+## Samples
+
+### A tour of the library
 
 ```bash
 dotnet run --project samples/ThrottledLogging.Sample
@@ -128,6 +131,55 @@ Throttle counters
 
 The bands are narrow there because the sample's items all take the same two milliseconds; a
 workload with real spread gives a wider one.
+
+### Loops that retry
+
+```bash
+dotnet run --project samples/ThrottledLogging.RetrySample
+```
+
+A loop that retries has to decide what an "item" is, and the two obvious answers give very
+different logs. This sample runs the same flaky workload both ways over the same data:
+
+```
+                        expected   processed   failed   sum vs expected
+  per attempt              1,000         989    1,032    2,021   (+1,021 too many)
+  per item                 1,000         989       11    1,000   (exact)
+
+  mean item duration:   per attempt 3.99ms, per item 7.99ms
+```
+
+**Scope per attempt** is what most people reach for, and it is wrong for anything that counts.
+`Processed` plus `Failed` runs past `TotalItems`, `Pending` hits zero while the loop is still
+going, the ETA counts down to a finish line in the wrong place, and every transient blip lands
+on the failure channel.
+
+**Scope per item, retries inside it**, measures what the caller actually cares about: getting
+this order in, however many attempts that took. The counts match the total exactly, the item's
+duration is the whole retry sequence — which is the number the ETA should extrapolate from —
+and only giving up counts as a failure. Log the intermediate attempts yourself, at a level you
+can turn off; they are detail about one item, not progress through the loop.
+
+The third pass shows the one thing neither modelling tells you. An order retried in place is
+genuinely submitting new events, so every emitted line reads `new=True`, exactly as a log of
+three hundred different orders would:
+
+```
+item order-7 Started — 0/1 done, 120 failed, new=True,  ..., 59 held since last line
+item order-7 Started — 0/1 done, 180 failed, new=True,  ..., 59 held since last line
+item order-7 Started — 0/1 done, 240 failed, new=True,  ..., 59 held since last line
+```
+
+Compare that with the same order hanging inside a single attempt, where nothing is submitted
+and the sweeper's heartbeat says so:
+
+```
+item order-7 Started — 0/1 done, 300 failed, new=False, ...,  0 held since last line
+```
+
+Both loops are equally stuck; only the second one looks it. Telling them apart needs the label
+carried alongside `IsNew`, which the library does not do yet — see "Still open" in the design
+document.
 
 ## Getting started
 
