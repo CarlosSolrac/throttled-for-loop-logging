@@ -1099,6 +1099,9 @@ for long runs.
   `ApplicationStopping` can keep submitting items and will log its normal end line. The 9008 line
   just records that shutdown began while it was running. If the operation ends while the flush is
   running, no 9008 is written for it.
+- **Logging providers are called under a per-operation lock** when a line comes from the
+  sweeper, the shutdown flush or the end of the operation. A provider must not block waiting for
+  that same operation to end. `OnEmitted` is not called under the lock, so it may.
 - **Getting lines off the machine at shutdown is up to the provider.** Application Insights
   buffers, which is why `Program.cs` flushes its channel on `ApplicationStopped`. A hard kill (out
   of memory, a platform timeout) skips all of this, and the last throttled line is all you have.

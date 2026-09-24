@@ -28,7 +28,10 @@ public sealed class ThrottledLoggingOptions
     /// <remarks>
     /// Runs inline on the thread that produced the event, so it must be quick. An exception thrown
     /// from here is swallowed and noted once at <c>Debug</c> rather than propagated into the
-    /// caller's loop.
+    /// caller's loop. It is never called while the operation's internal lock is held: for lines
+    /// written by the sweeper, by the shutdown flush or while the operation ends, the call comes
+    /// just after those lines are written. So it may end the operation, or wait for another thread
+    /// that does, without deadlocking.
     /// </remarks>
     public Action<ThrottledEvent>? OnEmitted { get; set; }
 }

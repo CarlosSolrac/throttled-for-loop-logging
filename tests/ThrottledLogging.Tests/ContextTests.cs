@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Testing;
 using Microsoft.Extensions.Time.Testing;
@@ -296,12 +297,14 @@ public sealed class ContextTests
     }
 
     [Fact]
-    public void Shutdown_does_not_report_an_operation_as_running_once_it_has_ended()
+    public void Shutdown_line_never_follows_the_operations_own_end_line()
     {
+        // The caller finishes while shutdown is flushing its held event: the observer, told about
+        // that flush, ends the operation. Whatever the interleaving, "still running" must come
+        // before the success line, never after it.
         IOperationScope? operation = null;
         TestHarness harness = new(o => o.OnEmitted = e =>
         {
-            // The caller finishes while shutdown is flushing its held event.
             if (e.Outcome == ItemOutcome.Succeeded && e.ItemLabel == "order-2")
             {
                 operation!.Success();
@@ -313,8 +316,65 @@ public sealed class ContextTests
 
         harness.Dispose();
 
-        Assert.Single(harness.Records, r => r.Id == 9001);
+        List<int> ids = [.. harness.Records.Select(static r => r.Id.Id)];
+        Assert.Single(ids, static id => id == 9001);
+        Assert.True(ids.IndexOf(9008) < ids.IndexOf(9001), string.Join(", ", ids));
+    }
+
+    [Fact]
+    public void Operation_ended_first_is_not_reported_as_running_at_shutdown()
+    {
+        TestHarness harness = new();
+        IOperationScope operation = harness.Logger.BeginOperation("ImportOrders");
+        harness.RunItem(operation, "order-1", TimeSpan.FromMilliseconds(10));
+        operation.Success();
+
+        harness.Dispose();
+
         Assert.DoesNotContain(harness.Records, r => r.Id == 9008);
+    }
+
+    [Fact]
+    public void Observer_waiting_for_another_thread_to_end_the_operation_does_not_deadlock()
+    {
+        // OnEmitted is user code. Here it hands the end of the operation to another thread and
+        // waits for it, from inside a sweep: if the observer ran under the operation's lock, the
+        // other thread's Success would wait for that lock forever.
+        IOperationScope? operation = null;
+        bool finished = false;
+        using TestHarness harness = new(o => o.OnEmitted = e =>
+        {
+            if (e.ItemLabel == "order-2")
+            {
+                finished = Task.Run(() => operation!.Success()).Wait(TimeSpan.FromSeconds(10));
+            }
+        });
+        operation = harness.Logger.BeginOperation("ImportOrders");
+        harness.RunItem(operation, "order-1", TimeSpan.FromMilliseconds(10));
+        harness.RunItem(operation, "order-2", TimeSpan.FromMilliseconds(10));   // held
+
+        harness.Time.Advance(TimeSpan.FromMinutes(1));
+        harness.Logger.SweepOnce();
+
+        Assert.True(finished);
+        Assert.Single(harness.Records, r => r.Id == 9001);
+    }
+
+    [Fact]
+    public void An_ended_operation_no_longer_keeps_the_callers_context_alive()
+    {
+        using TestHarness harness = new();
+        (IOperationScope operation, WeakReference captured) = BeginInsideAContextHoldingABigObject(harness.Logger);
+
+        operation.Success();
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+
+        // The operation itself is still referenced, as a caller holding onto it would; what it
+        // captured must not be.
+        Assert.False(captured.IsAlive);
+        GC.KeepAlive(operation);
     }
 
     [Fact]
@@ -442,6 +502,22 @@ public sealed class ContextTests
         broken.Dispose();
         healthy.Dispose();
     }
+
+    /// <summary>
+    /// Begins an operation on another thread whose context holds a large object in an AsyncLocal,
+    /// and returns the operation with a weak reference to that object. Nothing on the test's own
+    /// thread refers to the object, so only the operation's captured context can keep it alive.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static (IOperationScope Operation, WeakReference Captured) BeginInsideAContextHoldingABigObject(OperationLogger logger)
+        => Task.Run(() =>
+        {
+            byte[] big = new byte[1024 * 1024];
+            RequestState.Value = big;
+            return (logger.BeginOperation("ImportOrders"), new WeakReference(big));
+        }).GetAwaiter().GetResult();
+
+    private static readonly AsyncLocal<byte[]?> RequestState = new();
 
     /// <summary>
     /// Runs one sweep on a thread pool thread that inherits nothing from the test, the way the

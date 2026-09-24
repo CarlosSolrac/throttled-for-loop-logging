@@ -23,8 +23,11 @@ internal sealed class OperationScope : IOperationScope
     // Serialises the three things that decide an operation's last lines: End, a sweep, and the
     // shutdown flush. Without it, shutdown could check "not ended", lose the CPU while the caller
     // ends the operation, and then write "still running" after the success line; or a sweep could
-    // write a heartbeat after the end line. Monitor is reentrant, so an OnEmitted callback that ends
-    // the operation from inside one of these paths runs straight through rather than deadlocking.
+    // write a heartbeat after the end line. The lock is held while lines are written to the logging
+    // providers, but never while the OnEmitted observer runs: its notifications are collected and
+    // handed over once the lock is released, so an observer that waits for another thread to end
+    // this operation cannot deadlock. A logging provider must likewise not block waiting for this
+    // operation to end, since it is called under the lock.
     // (System.Threading.Lock would do, but only exists from .NET 9 and this also targets .NET 8.)
     private readonly object _lifecycleGate = new();
 
@@ -267,62 +270,76 @@ internal sealed class OperationScope : IOperationScope
 
     private void FlushForShutdownCore()
     {
-        lock (_lifecycleGate)
+        List<ThrottledEvent> deferred = [];
+        try
         {
-            if (HasEnded)
+            lock (_lifecycleGate)
             {
-                return;
+                FlushForShutdownLocked(deferred);
             }
-
-            if (Progress.Flush() is { } heldProgress)
-            {
-                Emit(heldProgress, _options.Level);
-            }
-
-            if (Failures.Flush() is { } heldFailure)
-            {
-                Emit(heldFailure, _options.FailureLevel);
-            }
-
-            // Checked again: an OnEmitted callback run by the flushes above may have ended the
-            // operation on this same thread (the lock is reentrant), and then it is not running.
-            if (HasEnded)
-            {
-                return;
-            }
-
-            OperationSnapshot snapshot = Snapshot();
-            using IDisposable? scope = BeginContextScope();
-            Log.OperationStillRunningAtShutdown(
-                _logger,
-                _options.FailureLevel,
-                Name,
-                Id,
-                snapshot.Elapsed.TotalSeconds,
-                snapshot.Processed,
-                snapshot.Failed,
-                snapshot.InFlight);
         }
+        finally
+        {
+            NotifyDeferred(deferred);
+        }
+    }
+
+    private void FlushForShutdownLocked(List<ThrottledEvent> deferred)
+    {
+        if (HasEnded)
+        {
+            return;
+        }
+
+        if (Progress.Flush() is { } heldProgress)
+        {
+            Emit(heldProgress, _options.Level, deferred);
+        }
+
+        if (Failures.Flush() is { } heldFailure)
+        {
+            Emit(heldFailure, _options.FailureLevel, deferred);
+        }
+
+        OperationSnapshot snapshot = Snapshot();
+        using IDisposable? scope = BeginContextScope();
+        Log.OperationStillRunningAtShutdown(
+            _logger,
+            _options.FailureLevel,
+            Name,
+            Id,
+            snapshot.Elapsed.TotalSeconds,
+            snapshot.Processed,
+            snapshot.Failed,
+            snapshot.InFlight);
     }
 
     private void SweepCore()
     {
-        lock (_lifecycleGate)
+        List<ThrottledEvent> deferred = [];
+        try
         {
-            if (HasEnded)
+            lock (_lifecycleGate)
             {
-                return;
-            }
+                if (HasEnded)
+                {
+                    return;
+                }
 
-            if (Progress.TryFlushDueToTime() is { } progress)
-            {
-                Emit(progress, _options.Level);
-            }
+                if (Progress.TryFlushDueToTime() is { } progress)
+                {
+                    Emit(progress, _options.Level, deferred);
+                }
 
-            if (Failures.TryFlushDueToTime() is { } failure)
-            {
-                Emit(failure, _options.FailureLevel);
+                if (Failures.TryFlushDueToTime() is { } failure)
+                {
+                    Emit(failure, _options.FailureLevel, deferred);
+                }
             }
+        }
+        finally
+        {
+            NotifyDeferred(deferred);
         }
     }
 
@@ -351,7 +368,14 @@ internal sealed class OperationScope : IOperationScope
     /// <returns>The scope to dispose, or <see langword="null"/>.</returns>
     private IDisposable? BeginContextScope() => _scopeState is null ? null : _logger.BeginScope(_scopeState);
 
-    private void Emit(in Emission emission, LogLevel level)
+    /// <summary>Writes one emission and tells the <c>OnEmitted</c> observer about it.</summary>
+    /// <param name="emission">What the channel released.</param>
+    /// <param name="level">The level to write at.</param>
+    /// <param name="deferred">
+    /// When the caller holds the lifecycle lock, the list to add the observer notification to
+    /// instead of making it now; the caller makes it once the lock is released. See <see cref="NotifyDeferred"/>.
+    /// </param>
+    private void Emit(in Emission emission, LogLevel level, List<ThrottledEvent>? deferred = null)
     {
         OperationSnapshot snapshot = Snapshot();
         PendingEvent pending = emission.Event;
@@ -364,7 +388,7 @@ internal sealed class OperationScope : IOperationScope
             WriteEmission(emission, pending, snapshot, level);
         }
 
-        _owner.NotifyEmitted(new ThrottledEvent
+        ThrottledEvent emitted = new()
         {
             OperationName = Name,
             OperationId = Id,
@@ -376,7 +400,41 @@ internal sealed class OperationScope : IOperationScope
             SuppressedSince = emission.SuppressedSince,
             Error = pending.Error,
             Progress = snapshot,
-        });
+        };
+
+        if (deferred is null)
+        {
+            _owner.NotifyEmitted(emitted);
+        }
+        else
+        {
+            deferred.Add(emitted);
+        }
+    }
+
+    /// <summary>
+    /// Hands notifications collected under the lifecycle lock to the <c>OnEmitted</c> observer, after
+    /// the lock has been released.
+    /// </summary>
+    /// <param name="deferred">The notifications, in the order their lines were written; may be <see langword="null"/>.</param>
+    /// <remarks>
+    /// The observer is user code, and user code may wait for another thread to end this very
+    /// operation. Called under the lock, that wait would deadlock: the other thread's End needs the
+    /// lock the observer's thread is holding. Called after it, the observer sees exactly what it saw
+    /// before, just a moment later, and anything it does to the operation (including ending it)
+    /// happens after the lines already written, never interleaved with them.
+    /// </remarks>
+    private void NotifyDeferred(List<ThrottledEvent>? deferred)
+    {
+        if (deferred is null)
+        {
+            return;
+        }
+
+        foreach (ThrottledEvent emitted in deferred)
+        {
+            _owner.NotifyEmitted(emitted);
+        }
     }
 
     private void WriteEmission(in Emission emission, PendingEvent pending, OperationSnapshot snapshot, LogLevel level)
@@ -445,41 +503,49 @@ internal sealed class OperationScope : IOperationScope
 
     private void End(Exception? error, string? note, bool? succeeded)
     {
-        lock (_lifecycleGate)
+        List<ThrottledEvent> deferred = [];
+        try
         {
-            if (Interlocked.Exchange(ref _ended, 1) != 0)
+            lock (_lifecycleGate)
             {
-                return;
-            }
+                if (Interlocked.Exchange(ref _ended, 1) != 0)
+                {
+                    return;
+                }
 
-            try
-            {
-                WriteClosingLines(error, note, succeeded);
+                try
+                {
+                    WriteClosingLines(error, note, succeeded, deferred);
+                }
+                finally
+                {
+                    // Whatever the logging providers did above, the operation leaves the registry
+                    // and lets go of the caller's context. Otherwise one throwing provider would
+                    // strand it in the singleton for the life of the process, already marked ended
+                    // so that no second Dispose could retire it.
+                    Volatile.Write(ref _callerContext, null);
+                    _owner.Retire(this, succeeded ?? false);
+                }
             }
-            finally
-            {
-                // Whatever the logging providers did above, the operation leaves the registry and
-                // lets go of the caller's context. Otherwise one throwing provider would strand it
-                // in the singleton for the life of the process, already marked ended so that no
-                // second Dispose could retire it.
-                Volatile.Write(ref _callerContext, null);
-                _owner.Retire(this, succeeded ?? false);
-            }
+        }
+        finally
+        {
+            NotifyDeferred(deferred);
         }
     }
 
-    private void WriteClosingLines(Exception? error, string? note, bool? succeeded)
+    private void WriteClosingLines(Exception? error, string? note, bool? succeeded, List<ThrottledEvent> deferred)
     {
         // Whatever is still held goes out before the closing line, so a run that ends badly never
         // hides its most recent failure.
         if (Progress.Flush() is { } heldProgress)
         {
-            Emit(heldProgress, _options.Level);
+            Emit(heldProgress, _options.Level, deferred);
         }
 
         if (Failures.Flush() is { } heldFailure)
         {
-            Emit(heldFailure, _options.FailureLevel);
+            Emit(heldFailure, _options.FailureLevel, deferred);
         }
 
         OperationSnapshot snapshot = Snapshot();

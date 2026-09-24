@@ -788,6 +788,10 @@ Two further changes came out of reviewing this work, and they apply whether or n
 
 Every path that decides an operation's last lines (`End`, a sweep, the shutdown flush) takes one
 lock per operation, so "still running" can never follow the operation's own end line, and a
-heartbeat never follows it either. `End` retires the operation and releases the captured context
+heartbeat never follows it either. The lock covers writing to the logging providers but not the
+`OnEmitted` observer: notifications made under it are collected and delivered once it is released,
+so an observer that waits for another thread to end the operation cannot deadlock (a second Codex
+pass raised this). A logging provider, which is called under the lock, must not block waiting for
+the same operation to end. `End` retires the operation and releases the captured context
 in a `finally`, so a throwing logging provider cannot strand it in the registry.
 
