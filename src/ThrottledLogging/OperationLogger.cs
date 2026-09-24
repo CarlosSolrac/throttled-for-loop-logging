@@ -60,7 +60,11 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
 
         if (_options.EnableSweeper)
         {
-            _sweeper = Task.Run(() => SweepLoopAsync(_shutdown.Token));
+            // Started with flow suppressed so the sweeper's thread inherits nothing from whoever
+            // happened to resolve this singleton first. Otherwise the first function invocation's
+            // scope and Activity would ride along on every heartbeat of every operation that did
+            // not capture its own context. Operations that did capture one are swept inside it.
+            _sweeper = CleanContext.Start(() => SweepLoopAsync(_shutdown.Token));
         }
     }
 
@@ -82,7 +86,18 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
         // Registered before the entry line, so a snapshot taken from another thread the instant
         // that line appears already sees the operation.
         _active[scope.Id] = scope;
-        scope.LogEntry();
+        try
+        {
+            scope.LogEntry();
+        }
+        catch
+        {
+            // The caller never receives the scope, so nothing could ever end it: take it back out
+            // of the registry rather than leave it (and the context it captured) there for good.
+            _active.TryRemove(scope.Id, out _);
+            throw;
+        }
+
         return scope;
     }
 
@@ -182,18 +197,30 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
 
         _shutdown.Cancel();
 
+        bool sweeperStopped = true;
         try
         {
-            _sweeper?.Wait(TimeSpan.FromSeconds(5));
+            sweeperStopped = _sweeper?.Wait(TimeSpan.FromSeconds(5)) ?? true;
         }
         catch (AggregateException)
         {
             // The sweeper only ever ends by cancellation; nothing here is worth surfacing.
         }
 
-        _shutdown.Dispose();
+        if (!sweeperStopped)
+        {
+            // A provider or an OnEmitted callback is blocking the sweeper mid-emission. The flush
+            // below is still safe to run alongside it: each operation's sweep and shutdown flush
+            // take the same lock, and a final flush waits for the channel rather than skipping. What
+            // cannot be promised is that the sweeper's own line reaches its provider before the
+            // host disposes that provider.
+            IgnoreFailure(() => Log.SweeperDidNotStop(_selfLogger));
+        }
+        else
+        {
+            _shutdown.Dispose();
+        }
 
-        // After the sweeper has stopped, so the two cannot race to flush the same held event.
         foreach (OperationScope scope in _active.Values)
         {
             try
@@ -204,8 +231,26 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
             catch (Exception error)
 #pragma warning restore CA1031
             {
-                Log.ShutdownFlushFailed(_selfLogger, error, scope.Name, scope.Id);
+                // Reported through the same factory, which may be the thing that is failing, so
+                // the report is best-effort too.
+                IgnoreFailure(() => Log.ShutdownFlushFailed(_selfLogger, error, scope.Name, scope.Id));
             }
+        }
+    }
+
+    /// <summary>Runs a diagnostic write that must never throw out of <see cref="Dispose"/>.</summary>
+    /// <param name="write">The write.</param>
+    private static void IgnoreFailure(Action write)
+    {
+        try
+        {
+            write();
+        }
+#pragma warning disable CA1031 // Nothing is left to report a failure to.
+        catch (Exception)
+#pragma warning restore CA1031
+        {
+            // Deliberately empty.
         }
     }
 

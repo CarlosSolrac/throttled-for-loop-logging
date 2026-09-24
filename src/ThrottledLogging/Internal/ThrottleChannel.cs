@@ -87,7 +87,7 @@ internal sealed class ThrottleChannel
             SubmittedAtUtc = submittedAtUtc,
         };
 
-        Interlocked.Exchange(ref _pending, pending);
+        Publish(pending);
         Interlocked.Increment(ref _submitted);
 
         long since = Interlocked.Increment(ref _sinceLastEmit);
@@ -144,8 +144,19 @@ internal sealed class ThrottleChannel
         return TryEmit(FlushReason.Sweeper);
     }
 
-    /// <summary>Writes whatever is still held, regardless of thresholds, when the operation ends.</summary>
+    /// <summary>
+    /// Writes whatever is still held, regardless of thresholds: when the operation ends, and when the
+    /// logger shuts down while it is still running.
+    /// </summary>
     /// <returns>The emission, or <see langword="null"/> when nothing is held or it has already been written.</returns>
+    /// <remarks>
+    /// Unlike the other paths, this one waits for the gate rather than giving up when another thread
+    /// holds it. A final flush that skipped would lose the newest event for good, since nothing
+    /// comes after it to catch up. The gate is only ever held for a few field writes, never across
+    /// logging, so the wait is short. The "already written" check is repeated inside the gate, so
+    /// two final flushes racing each other (the caller ending the operation while the logger shuts
+    /// down) write the event once, not twice.
+    /// </remarks>
     public Emission? Flush()
     {
         PendingEvent? pending = Volatile.Read(ref _pending);
@@ -157,16 +168,51 @@ internal sealed class ThrottleChannel
         return TryEmit(FlushReason.Final);
     }
 
+    /// <summary>
+    /// Makes <paramref name="pending"/> the held event, unless a later one is already held.
+    /// </summary>
+    /// <param name="pending">The event just submitted.</param>
+    /// <remarks>
+    /// Two threads can take sequences 5 and 6 and then publish in the opposite order. A plain
+    /// exchange would leave 5 held and lose 6 for good: never written, and not counted as skipped
+    /// either, because skipped is the gap between written sequences and 6 lies above every one of
+    /// them. Publishing only forwards keeps "hold the latest" true under contention. A stale event
+    /// that loses here is not lost from the counts; it sits inside the gap the next write accounts for.
+    /// </remarks>
+    private void Publish(PendingEvent pending)
+    {
+        PendingEvent? current = Volatile.Read(ref _pending);
+        while (current is null || current.Sequence < pending.Sequence)
+        {
+            PendingEvent? observed = Interlocked.CompareExchange(ref _pending, pending, current);
+            if (ReferenceEquals(observed, current))
+            {
+                return;
+            }
+
+            current = observed;
+        }
+    }
+
     private bool HasIntervalElapsed() => _time.GetElapsedTime(Interlocked.Read(ref _lastEmittedAt)) >= _everyInterval;
 
     /// <summary>
     /// Publishes the held event. Exactly one thread passes the gate; everyone else returns at once
     /// rather than queueing, because a duplicate line is worse than a missed trigger that the next
-    /// submission or sweep will catch anyway.
+    /// submission or sweep will catch anyway. The final flush is the exception: it waits its turn,
+    /// see <see cref="Flush"/>.
     /// </summary>
     private Emission? TryEmit(FlushReason reason)
     {
-        if (Interlocked.CompareExchange(ref _gate, 1, 0) != 0)
+        if (reason == FlushReason.Final)
+        {
+            SpinWait spinner = default;
+            while (Interlocked.CompareExchange(ref _gate, 1, 0) != 0)
+            {
+                spinner.SpinOnce();
+            }
+        }
+        else if (Interlocked.CompareExchange(ref _gate, 1, 0) != 0)
         {
             return null;
         }
@@ -175,6 +221,18 @@ internal sealed class ThrottleChannel
         {
             PendingEvent? pending = Volatile.Read(ref _pending);
             if (pending is null)
+            {
+                return null;
+            }
+
+            // Only the sweeper may write an event that has already been written: that repeat is the
+            // stalled-loop heartbeat, and says so with IsNew=false. Every other reason writes only
+            // something new. Checked here, under the gate, because the threshold or "already
+            // written" check the caller made before reaching the gate can be overtaken by another
+            // thread's emission in between. Without it two submitters that both saw the count
+            // threshold would write the same event twice, and the second write would be counted as
+            // one more emission than there were events.
+            if (reason != FlushReason.Sweeper && pending.Sequence == Interlocked.Read(ref _lastEmittedSequence))
             {
                 return null;
             }

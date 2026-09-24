@@ -52,8 +52,8 @@ had reached. If that is an operation's last line, the process died before the op
 |---|---|---|---|
 | Storage queue | `QueueMessage.MessageId` | `DequeueCount` | `InsertedOn` |
 | Service Bus | `ServiceBusReceivedMessage.MessageId` | `DeliveryCount` | `CorrelationId`, `SequenceNumber`, `EnqueuedTime`; the sender's trace context arrives with the message |
-| Timer | The data the run covers, e.g. the hour being imported | Always 1 | `IsPastDue`, `ScheduleStatus.Last`/`Next` (persisted by the host in storage) |
-| Durable Functions | The orchestration `InstanceId` | Not visible to an activity | Chunk index; progress itself survives, because each activity is checkpointed |
+| Timer | The data the run covers, e.g. the hour being imported, read from a checkpoint in storage | Always 1 (count InvocationIds instead) | `IsPastDue`, `ScheduleStatus.Last`/`Next` (persisted by the host in storage) |
+| Durable Functions | The orchestration `InstanceId` | Not visible to an activity | Chunk index; finished chunks survive, because each completed activity is checkpointed |
 
 Every trigger also has an `InvocationId`, which is new on every run, and runs on a host instance
 (`WEBSITE_INSTANCE_ID`, shown as `cloud_RoleInstance`). Neither survives a restart, and that is
@@ -92,6 +92,7 @@ using Examples;
 using Microsoft.ApplicationInsights;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Builder;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -114,7 +115,9 @@ builder.Logging.Services.Configure<ApplicationInsightsLoggerOptions>(options => 
 
 // 3. The Application Insights SDK adds a filter rule that drops everything below Warning. Remove
 //    it, or every Information line this library writes (entry, progress, success) disappears and
-//    only failures reach the portal. Levels are then governed by host.json / appsettings as usual.
+//    only failures reach the portal. Levels are then set by the worker's own configuration (the
+//    "Logging" section of appsettings.json or the app settings Logging__LogLevel__...), not by
+//    host.json: host.json governs the host process's logs, and these come from the worker.
 builder.Logging.Services.Configure<LoggerFilterOptions>(options =>
 {
     LoggerFilterRule? defaultRule = options.Rules.FirstOrDefault(rule =>
@@ -138,6 +141,9 @@ builder.Services.AddThrottledLogging(options =>
 // Stand-in for your data access. Replace with whatever the functions really read and write.
 builder.Services.AddSingleton<IOrderStore, InMemoryOrderStore>();
 
+// The worker reads appsettings.json only if asked to. Without this, a "Logging" section there has no effect.
+builder.Configuration.AddJsonFile("appsettings.json", optional: true, reloadOnChange: false);
+
 IHost host = builder.Build();
 
 // 5. Shutdown, in the right order. When the platform recycles or scales in, the host signals
@@ -148,6 +154,8 @@ IHost host = builder.Build();
 //      still flowing. The operations themselves keep working; a function that finishes during
 //      the drain still logs its normal end line afterwards.
 //    - on ApplicationStopped, flush the telemetry channel so those lines leave the machine.
+//    Operations that finish during the drain still write their end lines afterwards, but those
+//    rely on the telemetry channel's own flush when the container disposes it.
 IHostApplicationLifetime lifetime = host.Services.GetRequiredService<IHostApplicationLifetime>();
 OperationLogger operationLogger = host.Services.GetRequiredService<OperationLogger>();
 TelemetryClient telemetry = host.Services.GetRequiredService<TelemetryClient>();
@@ -183,6 +191,13 @@ public interface IOrderStore
 
     /// <summary>Processes one order. Throws when it fails.</summary>
     Task ProcessAsync(Order order, CancellationToken cancellationToken);
+
+    /// <summary>The oldest hour, before <paramref name="before"/>, not yet marked done; <see langword="null"/> when all are.</summary>
+    /// <remarks>Backed by durable storage (a table row, a blob), so it survives restarts. This is the timer's checkpoint.</remarks>
+    Task<DateTimeOffset?> OldestPendingHourAsync(DateTimeOffset before, CancellationToken cancellationToken);
+
+    /// <summary>Records that <paramref name="hour"/> has been imported.</summary>
+    Task MarkHourDoneAsync(DateTimeOffset hour, CancellationToken cancellationToken);
 }
 
 /// <summary>A trivial implementation for local runs.</summary>
@@ -203,6 +218,12 @@ public sealed class InMemoryOrderStore : IOrderStore
 
     /// <inheritdoc />
     public Task ProcessAsync(Order order, CancellationToken cancellationToken) => Task.CompletedTask;
+
+    /// <inheritdoc />
+    public Task<DateTimeOffset?> OldestPendingHourAsync(DateTimeOffset before, CancellationToken cancellationToken) => Task.FromResult<DateTimeOffset?>(null);
+
+    /// <inheritdoc />
+    public Task MarkHourDoneAsync(DateTimeOffset hour, CancellationToken cancellationToken) => Task.CompletedTask;
 }
 ```
 
@@ -262,9 +283,28 @@ public static class InvocationContext
             ["ProcessId"] = Environment.ProcessId,
             ["ProcessStartedUtc"] = ProcessStartedUtc,
             // Activity.Current is the invocation's activity when Application Insights is wired up in
-            // the worker; the trace context from the host is the fallback.
-            ["TraceId"] = Activity.Current?.TraceId.ToString() ?? context.TraceContext.TraceParent,
+            // the worker; the trace context the host passed in is the fallback. Either way this is
+            // the bare 32-hex-digit trace id, the same value Application Insights stores as operation_Id.
+            ["TraceId"] = Activity.Current?.TraceId.ToString() ?? TraceIdFrom(context.TraceContext.TraceParent),
         };
+    }
+
+    /// <summary>
+    /// Extracts the trace id from a W3C <c>traceparent</c> header, which reads
+    /// <c>version-traceid-parentid-flags</c>, for example
+    /// <c>00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01</c>.
+    /// </summary>
+    /// <param name="traceParent">The header value, or <see langword="null"/>.</param>
+    /// <returns>The 32-character trace id, or <see langword="null"/> when the header is missing or malformed.</returns>
+    private static string? TraceIdFrom(string? traceParent)
+    {
+        if (string.IsNullOrEmpty(traceParent))
+        {
+            return null;
+        }
+
+        string[] parts = traceParent.Split('-');
+        return parts.Length == 4 && parts[1].Length == 32 ? parts[1] : null;
     }
 
     /// <summary>
@@ -300,12 +340,20 @@ namespace Examples;
 /// Storage queue trigger: one message names a batch, and the function works through every order in it.
 /// </summary>
 /// <remarks>
+/// <para>
 /// What survives a restart here is the message. Its <c>MessageId</c> stays the same on every
-/// redelivery and its <c>DequeueCount</c> goes up, so BusinessKey = MessageId and
-/// Attempt = DequeueCount group every try of the same batch together, on any instance.
-/// Watch the visibility timeout: if the loop outlives it, the message becomes visible again and a
-/// second instance starts the same batch while the first is still running. Both runs then log
-/// under one BusinessKey with different InvocationIds and the same Attempt number.
+/// redelivery and its <c>DequeueCount</c> goes up by one each time it is dequeued, so
+/// BusinessKey = MessageId and Attempt = DequeueCount group every try of the same batch together,
+/// on any instance, and number them.
+/// </para>
+/// <para>
+/// While the function runs, the queue trigger keeps extending the message's visibility, so a long
+/// loop does not by itself hand the message to another instance. The message comes back when the
+/// function throws (after the host's <c>visibilityTimeout</c>), or when the process dies and can no
+/// longer extend it (once the current visibility window lapses). Either way the next attempt has a
+/// higher DequeueCount. After <c>maxDequeueCount</c> attempts (5 by default) the message moves to
+/// the <c>-poison</c> queue instead, and the last attempt in the log is the last there will be.
+/// </para>
 /// </remarks>
 public sealed class QueueImport
 {
@@ -386,9 +434,10 @@ public sealed class QueueImport
 
 ## Service Bus
 
-The same shape, with two additions: the lock has to be renewed while a long batch runs, and the
-sender's trace context comes along, so the sender's request and this function's lines share one
-`operation_Id` in Application Insights.
+The same shape, with three differences. The lock-renewal window has to cover the longest batch,
+which is a host.json setting rather than code. The message is settled before success is
+recorded. And the sender's trace context comes along, so the sender's request and this
+function's lines share one `operation_Id` in Application Insights.
 
 ```csharp
 using Azure.Messaging.ServiceBus;
@@ -399,21 +448,34 @@ using ThrottledLogging;
 namespace Examples;
 
 /// <summary>
-/// Service Bus trigger with manual settlement: the function completes the message itself, and
-/// renews its lock while a long batch runs.
+/// Service Bus trigger with manual settlement: the function completes or abandons the message
+/// itself, only after the batch's outcome is known.
 /// </summary>
 /// <remarks>
+/// <para>
 /// Service Bus gives the best context of the four triggers. <c>MessageId</c> is stable across
 /// redeliveries and <c>DeliveryCount</c> counts them, like a storage queue. On top of that the
 /// sender's trace context travels with the message, so Application Insights puts the sender's
 /// request and this function's logs under one operation_Id, and <c>CorrelationId</c> carries
 /// whatever the sender chose to put there.
+/// </para>
+/// <para>
+/// Keeping the lock for a long batch: a queue's lock lasts one minute by default (the queue's
+/// <c>LockDuration</c>). The Functions extension renews it automatically while the function runs,
+/// but only for up to <c>maxAutoLockRenewalDuration</c>, five minutes by default. A batch that can
+/// run longer needs that raised in host.json, to more than the longest batch you expect:
+/// <code>
+/// { "version": "2.0", "extensions": { "serviceBus": { "maxAutoLockRenewalDuration": "02:00:00" } } }
+/// </code>
+/// Renewal is by the extension on its own timer, so it keeps going during one slow item, which
+/// renewing by hand between items would not. If the lock is lost anyway, settling fails with
+/// <c>MessageLockLost</c>, the message is redelivered with DeliveryCount + 1, and the operation
+/// below is logged as failed, not succeeded. Session-enabled queues lock the session rather than
+/// the message; check the extension's session settings instead of relying on this paragraph.
+/// </para>
 /// </remarks>
 public sealed class ServiceBusImport
 {
-    // Renew well before the lock's default five-minute duration runs out.
-    private static readonly TimeSpan LockRenewalInterval = TimeSpan.FromMinutes(2);
-
     private readonly IOperationLogger _operations;
     private readonly IOrderStore _orders;
     private readonly ILogger<ServiceBusImport> _logger;
@@ -428,7 +490,7 @@ public sealed class ServiceBusImport
 
     /// <summary>Imports the batch the message names, then completes the message.</summary>
     /// <param name="message">The received message, bound whole for its metadata.</param>
-    /// <param name="actions">Settlement and lock renewal for that message.</param>
+    /// <param name="actions">Settlement for that message.</param>
     /// <param name="context">The invocation.</param>
     /// <param name="cancellationToken">Signalled when the host is shutting down.</param>
     [Function(nameof(ServiceBusImport))]
@@ -445,41 +507,34 @@ public sealed class ServiceBusImport
         pairs["CorrelationId"] = message.CorrelationId;
         pairs["SequenceNumber"] = message.SequenceNumber;
         pairs["EnqueuedUtc"] = message.EnqueuedTime;
+        pairs["LockedUntilUtc"] = message.LockedUntil;
         using IDisposable? scope = _logger.BeginInvocationScope(pairs);
 
         OperationOptions options = _operations.DefaultOptions;
         options.TotalItems = await _orders.CountAsync(batchId, cancellationToken);
 
         using IOperationScope operation = _operations.BeginOperation("ImportOrders", options);
-        DateTimeOffset lockRenewedAt = DateTimeOffset.UtcNow;
         try
         {
             await foreach (Order order in _orders.ReadAsync(batchId, cancellationToken))
             {
-                using (IItemScope item = operation.BeginItem(order.Id))
+                using IItemScope item = operation.BeginItem(order.Id);
+                try
                 {
-                    try
-                    {
-                        await _orders.ProcessAsync(order, cancellationToken);
-                        item.Success();
-                    }
-                    catch (Exception error) when (error is not OperationCanceledException)
-                    {
-                        item.Failure(error);
-                    }
+                    await _orders.ProcessAsync(order, cancellationToken);
+                    item.Success();
                 }
-
-                // Losing the lock mid-batch would hand the message to another instance while this
-                // one is still working: two runs, one BusinessKey, same DeliveryCount.
-                if (DateTimeOffset.UtcNow - lockRenewedAt > LockRenewalInterval)
+                catch (Exception error) when (error is not OperationCanceledException)
                 {
-                    await actions.RenewMessageLockAsync(message, cancellationToken);
-                    lockRenewedAt = DateTimeOffset.UtcNow;
+                    item.Failure(error);
                 }
             }
 
-            operation.Success($"batch {batchId}");
+            // Settle first, then record success. The first outcome an operation records is the one
+            // it keeps, so logging success before CompleteMessageAsync would leave a success line
+            // for a batch whose message then failed to settle and came back.
             await actions.CompleteMessageAsync(message, cancellationToken);
+            operation.Success($"batch {batchId}");
         }
         catch (Exception error)
         {
@@ -487,8 +542,17 @@ public sealed class ServiceBusImport
 
             // Abandon so the message is redelivered now with DeliveryCount + 1, rather than waiting
             // for the lock to expire. After MaxDeliveryCount it goes to the dead-letter queue, and
-            // the log shows every attempt under one BusinessKey.
-            await actions.AbandonMessageAsync(message, cancellationToken: CancellationToken.None);
+            // the log shows every attempt under one BusinessKey. Abandoning can fail too (the lock
+            // may be what was lost); that must not hide the original error, so it is only logged.
+            try
+            {
+                await actions.AbandonMessageAsync(message, cancellationToken: CancellationToken.None);
+            }
+            catch (Exception abandonError) when (abandonError is ServiceBusException or InvalidOperationException)
+            {
+                _logger.LogWarning(abandonError, "Could not abandon message {MessageId}; it will be redelivered when its lock expires", message.MessageId);
+            }
+
             throw;
         }
     }
@@ -497,9 +561,10 @@ public sealed class ServiceBusImport
 
 ## Timer
 
-A timer has no message, no delivery count and no redelivery. The stable key has to be the data
-the run covers. This example also shows the delegate form, `RunAsync`, in place of the explicit
-`try`/`catch`.
+A timer has no message, no delivery count and no redelivery, so something else has to remember
+what is done. Here that is a checkpoint in storage, and the stable key is the hour of data the run
+covers, never the time it happens to run. This example also shows the delegate form, `RunAsync`,
+in place of the explicit `try`/`catch`.
 
 ```csharp
 using System.Globalization;
@@ -510,17 +575,29 @@ using ThrottledLogging;
 namespace Examples;
 
 /// <summary>
-/// Timer trigger: every hour, import the orders that arrived in the previous hour.
+/// Timer trigger: every hour, import every finished hour of orders that has not been imported yet.
 /// </summary>
 /// <remarks>
-/// A timer has no message, so nothing counts attempts and nothing is redelivered: if the host
-/// restarts mid-run, that hour is simply not finished until something notices. The stable key is
-/// therefore the data the run covers, not the run itself. Naming the hour means a rerun of the
-/// same hour, whether by a catch-up after <c>IsPastDue</c> or by hand, shares its BusinessKey
-/// with the run that failed.
+/// <para>
+/// A timer has no message, so nothing counts attempts and nothing is redelivered. If the host
+/// restarts mid-run, that hour is simply not finished. So the timer does not decide what to import
+/// from the clock: "the hour before now" would skip 09:00 if the 10:05 run were delayed until
+/// 12:05, and would name a different hour on a manual rerun. It asks a checkpoint in durable
+/// storage for the oldest hour not yet done, imports it, marks it done, and repeats. A run that
+/// dies leaves its hour unmarked, and the next tick picks it up again.
+/// </para>
+/// <para>
+/// The hour is the BusinessKey, so every attempt at one hour shares a key however many ticks it
+/// took. Attempt stays 1 because nothing counts attempts for a timer; count distinct InvocationIds
+/// per BusinessKey in the log instead (see the retry query in the guide).
+/// </para>
 /// </remarks>
 public sealed class TimerImport
 {
+    // Bounds one tick's work, so a long outage is caught up over several ticks rather than one
+    // invocation running into the function timeout.
+    private const int MaxHoursPerRun = 6;
+
     private readonly IOperationLogger _operations;
     private readonly IOrderStore _orders;
     private readonly ILogger<TimerImport> _logger;
@@ -533,21 +610,36 @@ public sealed class TimerImport
         _logger = logger;
     }
 
-    /// <summary>Imports the previous hour's orders.</summary>
+    /// <summary>Imports pending hours, oldest first.</summary>
     /// <param name="timer">Schedule state, persisted by the host in storage between runs.</param>
     /// <param name="context">The invocation.</param>
     /// <param name="cancellationToken">Signalled when the host is shutting down.</param>
     [Function(nameof(TimerImport))]
     public async Task RunAsync([TimerTrigger("0 5 * * * *")] TimerInfo timer, FunctionContext context, CancellationToken cancellationToken)
     {
-        // The hour being imported, e.g. "orders-2026-09-24T17". Stable however many times it is run.
+        // Only whole hours that have ended are eligible.
         DateTimeOffset now = DateTimeOffset.UtcNow;
-        DateTimeOffset hour = new DateTimeOffset(now.Year, now.Month, now.Day, now.Hour, 0, 0, TimeSpan.Zero).AddHours(-1);
+        DateTimeOffset currentHour = new(now.Year, now.Month, now.Day, now.Hour, 0, 0, TimeSpan.Zero);
+
+        for (int run = 0; run < MaxHoursPerRun; run++)
+        {
+            if (await _orders.OldestPendingHourAsync(currentHour, cancellationToken) is not { } hour)
+            {
+                return;
+            }
+
+            await ImportHourAsync(hour, timer, context, cancellationToken);
+            await _orders.MarkHourDoneAsync(hour, cancellationToken);
+        }
+    }
+
+    private async Task ImportHourAsync(DateTimeOffset hour, TimerInfo timer, FunctionContext context, CancellationToken cancellationToken)
+    {
+        // e.g. "orders-2026-09-24T09": stable however many ticks or reruns it takes.
         string batchId = "orders-" + hour.ToString("yyyy-MM-dd'T'HH", CultureInfo.InvariantCulture);
 
-        // No delivery count exists for a timer, so Attempt is always 1. IsPastDue says the
-        // schedule was missed (the app was down, or a previous run overran), which is the closest
-        // a timer gets to "this is a retry".
+        // Opened per hour, so each hour's lines carry that hour's key. IsPastDue says the schedule
+        // itself was missed (the app was down or a previous tick overran).
         Dictionary<string, object?> pairs = InvocationContext.Create(context, "Timer", businessKey: batchId, attempt: 1);
         pairs["IsPastDue"] = timer.IsPastDue;
         pairs["ScheduleLastUtc"] = timer.ScheduleStatus?.Last;
@@ -559,7 +651,8 @@ public sealed class TimerImport
 
         // RunAsync (an extension on IOperationLogger) begins the operation, logs success when the
         // delegate returns and failure when it throws, and ends it either way: the explicit
-        // try/catch of the queue example, with less to get wrong.
+        // try/catch of the queue example, with less to get wrong. A failure propagates, so the
+        // hour is not marked done and the next tick retries it.
         await _operations.RunAsync(
             "ImportOrders",
             async (operation, ct) =>
@@ -586,8 +679,10 @@ public sealed class TimerImport
 
 ## Durable Functions
 
-The only pattern here where a restart doesn't lose progress. The orchestrator splits the batch,
-each chunk is an activity, and the framework checkpoints each completed activity. The throttled
+The only pattern here where a restart doesn't throw away finished work. The orchestrator splits the
+batch, each chunk is an activity, and the framework checkpoints each completed activity. A chunk
+that was running when the process died runs again from its start, so processing has to be
+idempotent. The throttled
 operation lives in the activity. An orchestrator replays its code from the top, so an operation
 started there would log its entry line on every replay.
 
@@ -618,9 +713,17 @@ public sealed record ChunkResult(long Processed, long Failed);
 /// </summary>
 /// <remarks>
 /// <para>
-/// This is the only one of the four patterns where a restart does not lose progress. Each
-/// completed activity is checkpointed; after a recycle the orchestrator replays, skips the chunks
-/// already done, and carries on. The InstanceId never changes, so it is the BusinessKey.
+/// This is the only one of the four patterns where a restart does not throw away finished work.
+/// Each completed activity is checkpointed; after a recycle the orchestrator replays, skips the
+/// chunks already done, and carries on. The InstanceId never changes, so it is the BusinessKey.
+/// </para>
+/// <para>
+/// What a checkpoint does not do: an activity runs at least once, not exactly once. If the process
+/// dies halfway through a 5,000-order chunk, or after the last order but before the result is
+/// recorded, the whole chunk runs again. Processing an order must therefore be idempotent (an
+/// upsert, a check for "already imported"), or the chunk has to keep its own per-order progress in
+/// durable storage. The log shows it plainly: two operations for one BusinessKey and ChunkIndex,
+/// with different InvocationIds.
 /// </para>
 /// <para>
 /// ThrottledLogging belongs in the activity, never in the orchestrator. An orchestrator's code
@@ -876,65 +979,97 @@ Each structured field of a line becomes a `customDimensions` entry. That covers 
 fields (`OperationId`, `ItemLabel`, `IsNew`, `Processed`, …) and every scope pair. `operation_Id`
 is the W3C trace id.
 
+Two things decide where to look:
+
+- **Lines that carry an exception go to the `exceptions` table, not `traces`.** With the 2.x
+  provider, `TrackExceptionsAsExceptionTelemetry` is on by default. That includes item failures
+  (9005) and failed operations (9002). Every query below therefore starts from a union of both
+  tables. The alternative is to set `TrackExceptionsAsExceptionTelemetry = false` on
+  `ApplicationInsightsLoggerOptions` and keep everything in `traces`.
+- **Adaptive sampling is on by default**, and it can drop Information lines under load. A missing
+  line is then not proof that it was never written. For logs you query by absence ("never
+  finished"), exclude traces from sampling, for example with
+  `AddApplicationInsightsTelemetryWorkerService(o => o.EnableAdaptiveSampling = false)`, or
+  configure sampling to exclude `Trace` and `Exception` telemetry.
+
+A helper to paste at the top of each query (or save as a function):
+
+```kusto
+let lines = (since: timespan) {
+    union traces, exceptions
+    | where timestamp > ago(since)
+    | extend Message = coalesce(message, tostring(customDimensions.FormattedMessage), outerMessage),
+             EventId = toint(customDimensions.EventId),
+             OperationId = tostring(customDimensions.OperationId),
+             BusinessKey = tostring(customDimensions.BusinessKey),
+             InvocationId = tostring(customDimensions.InvocationId),
+             Attempt = toint(customDimensions.Attempt),
+             ChunkIndex = toint(customDimensions.ChunkIndex),
+             ProcessId = toint(customDimensions.ProcessId)
+};
+```
+
 **Every line for one piece of work, across retries, instances and recycles:**
 
 ```kusto
-traces
-| where timestamp > ago(7d)
-| where tostring(customDimensions.BusinessKey) == "<message id, batch id or instance id>"
-| extend Attempt = toint(customDimensions.Attempt),
-         InvocationId = tostring(customDimensions.InvocationId),
-         OperationId = tostring(customDimensions.OperationId),
-         ProcessId = toint(customDimensions.ProcessId),
-         EventId = toint(customDimensions.EventId)
-| project timestamp, Attempt, cloud_RoleInstance, ProcessId, InvocationId, OperationId, EventId, severityLevel, message
+lines(7d)
+| where BusinessKey == "<message id, batch id or instance id>"
+| project timestamp, itemType, Attempt, cloud_RoleInstance, ProcessId, InvocationId, OperationId, EventId, severityLevel, Message
 | order by timestamp asc
 ```
 
-**Operations that never finished**, meaning no success, failure or incomplete line. The last line
-each one wrote shows how far it got, and `ShutDown` tells you whether the host saw it coming:
+**Operations that never finished**, meaning no success (9001), failure (9002) or incomplete (9003)
+line. The last line each one wrote shows how far it got. `ShutDown` tells you whether the host saw
+it coming. With no 9008 either, the process was killed outright, or sampling dropped the lines
+(see above).
 
 ```kusto
-traces
-| where timestamp > ago(1d)
-| extend OperationId = tostring(customDimensions.OperationId), EventId = toint(customDimensions.EventId)
+lines(1d)
 | where isnotempty(OperationId)
 | summarize Started = min(timestamp),
             LastLine = max(timestamp),
             Ended = countif(EventId in (9001, 9002, 9003)),
             ShutDown = countif(EventId == 9008),
-            LastMessage = arg_max(timestamp, message),
-            BusinessKey = take_any(tostring(customDimensions.BusinessKey)),
+            arg_max(timestamp, Message),
+            BusinessKey = take_any(BusinessKey),
             Instance = take_any(cloud_RoleInstance)
             by OperationId
 | where Ended == 0
 | order by LastLine desc
 ```
 
-**Retries per piece of work, and how each attempt ended:**
+**Retries: pieces of work that took more than one execution, and how each one ended.** This
+counts executions (InvocationIds), not outcome lines. One execution can write both 9008 at
+shutdown and 9001 once it drains, and that is not a retry. Durable chunks are separate work,
+so they are keyed by chunk as well.
 
 ```kusto
-traces
-| where timestamp > ago(7d)
-| extend BusinessKey = tostring(customDimensions.BusinessKey),
-         Attempt = toint(customDimensions.Attempt),
-         EventId = toint(customDimensions.EventId)
-| where EventId in (9001, 9002, 9003, 9008)
-| summarize Outcome = make_list(pack("attempt", Attempt, "event", EventId, "at", timestamp)) by BusinessKey
-| where array_length(Outcome) > 1
+lines(7d)
+| where isnotempty(OperationId) and isnotempty(BusinessKey)
+| summarize Outcome = take_anyif(EventId, EventId in (9001, 9002, 9003)),
+            Attempt = max(Attempt),
+            Started = min(timestamp)
+            by BusinessKey, ChunkIndex, InvocationId, OperationId
+| extend Outcome = case(Outcome == 9001, "succeeded", Outcome == 9002, "failed", Outcome == 9003, "incomplete", "never finished")
+| summarize Executions = dcount(InvocationId),
+            History = make_list(bag_pack("started", Started, "attempt", Attempt, "outcome", Outcome))
+            by BusinessKey, ChunkIndex
+| where Executions > 1
 ```
 
-**Progress of everything running now, from the latest progress line per operation:**
+**Progress of everything still running**, from the latest progress line of each operation that
+has no closing line yet:
 
 ```kusto
-traces
-| where timestamp > ago(1h)
-| extend EventId = toint(customDimensions.EventId)
+let recent = lines(1h) | where isnotempty(OperationId);
+let ended = recent | where EventId in (9001, 9002, 9003) | distinct OperationId;
+recent
 | where EventId == 9004
-| summarize arg_max(timestamp, *) by OperationId = tostring(customDimensions.OperationId)
+| where OperationId !in (ended)
+| summarize arg_max(timestamp, *) by OperationId
 | project timestamp,
           Operation = tostring(customDimensions.OperationName),
-          BusinessKey = tostring(customDimensions.BusinessKey),
+          BusinessKey,
           Processed = tolong(customDimensions.Processed),
           Total = tolong(customDimensions.TotalItems),
           Failed = tolong(customDimensions.Failed),
@@ -943,23 +1078,40 @@ traces
 ```
 
 A row whose `timestamp` keeps advancing while `IsNew` stays `false` is a loop that has stopped
-moving: the sweeper keeps resending the same held event as a heartbeat.
+moving: the sweeper keeps resending the same held event as a heartbeat. An operation that started
+more than an hour ago and has written nothing since falls outside this window. Widen `lines(1h)`
+for long runs.
 
 ## Things to know
 
 - **Context is captured at `BeginOperation`.** Open your scope *before* you call it. A scope
   opened afterwards still reaches lines written on your own thread, but not the heartbeat lines
   from the sweeper.
-- **The captured context lives as long as the operation.** It holds the caller's `AsyncLocal`
-  values, so anything large in them stays in memory until the operation ends. End operations
-  (`using` does it for you).
+- **The captured context is held until the operation ends, then released.** It includes the
+  caller's `AsyncLocal` values, so anything large in them stays in memory while the operation runs.
+  End operations promptly (`using` does it for you). An operation that is never ended keeps its
+  context until the process exits.
 - **A caller that suppresses execution-context flow** (`ExecutionContext.SuppressFlow`) captures
-  nothing. The heartbeat then carries only `OperationOptions.Scope` and the operation id, which is
-  how every line behaved before 0.2.0.
+  nothing. Its heartbeat and shutdown lines then run in an empty context, carrying only
+  `OperationOptions.Scope` and the operation id. They never borrow the context of whichever
+  thread happens to sweep or dispose.
 - **The shutdown flush leaves operations open.** A function still draining after
   `ApplicationStopping` can keep submitting items and will log its normal end line. The 9008 line
-  just records that shutdown began while it was running.
+  just records that shutdown began while it was running. If the operation ends while the flush is
+  running, no 9008 is written for it.
 - **Getting lines off the machine at shutdown is up to the provider.** Application Insights
   buffers, which is why `Program.cs` flushes its channel on `ApplicationStopped`. A hard kill (out
   of memory, a platform timeout) skips all of this, and the last throttled line is all you have.
-  The first query above is how you notice.
+  The "never finished" query is how you notice.
+
+## Upgrading from 0.1.0
+
+- **Message text changed** for events 9004, 9005 and 9006: each now reads
+  `{OperationName} ({OperationId}) …` where it used to read `{OperationName} …`. This affects
+  anything that parses the rendered text or matches on `{OriginalFormat}`. The structured
+  properties only gained `OperationId`, and every event id is unchanged.
+- **New events:** 9008 (still running at shutdown, Warning), 9009 (a shutdown flush failed,
+  Warning), 9010 (the sweeper did not stop within five seconds, Warning).
+- **New API:** `OperationOptions.Scope`. Nothing was removed and no default changed.
+- **Behaviour at shutdown:** disposing `OperationLogger` now writes lines where it used to write
+  none.

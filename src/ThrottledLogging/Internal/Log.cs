@@ -98,6 +98,9 @@ internal static partial class Log
     [LoggerMessage(EventId = 9009, Level = LogLevel.Warning, Message = "Flushing {OperationName} ({OperationId}) at shutdown failed.")]
     public static partial void ShutdownFlushFailed(ILogger logger, Exception error, string operationName, Guid operationId);
 
+    [LoggerMessage(EventId = 9010, Level = LogLevel.Warning, Message = "The ThrottledLogging sweeper did not stop within five seconds; flushing running operations anyway.")]
+    public static partial void SweeperDidNotStop(ILogger logger);
+
     [LoggerMessage(EventId = 9007, Level = LogLevel.Debug, Message = "A ThrottledLogging observer threw and was ignored.")]
     public static partial void ObserverThrew(ILogger logger, Exception error);
 }

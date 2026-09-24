@@ -774,3 +774,20 @@ Insights are in [`../azure-functions-and-application-insights.md`](../azure-func
 The scope is opened per line rather than once per operation because logging scopes live in the
 ambient context of whichever thread writes, and an operation's lines come from several threads.
 
+Two further changes came out of reviewing this work, and they apply whether or not a host is involved:
+
+- **The held event only moves forward.** Two submitters can take sequences 5 and 6 and publish in
+  the opposite order; a plain exchange then left 5 held and lost 6 entirely. `ThrottleChannel`
+  now publishes with a compare-and-swap that never replaces a later event with an earlier one.
+- **Only the sweeper may write an already-written event.** Two submitters that both saw the count
+  threshold could each pass the gate in turn and write the same event twice, the second time as
+  `IsNew=false`, and the second write was counted as an extra emission. The "already written"
+  check now happens under the gate for every reason except the sweeper's heartbeat, and a final
+  flush waits for the gate instead of giving up. `ConcurrencyTests` caught this intermittently
+  (about one run in eight on `main` before this change).
+
+Every path that decides an operation's last lines (`End`, a sweep, the shutdown flush) takes one
+lock per operation, so "still running" can never follow the operation's own end line, and a
+heartbeat never follows it either. `End` retires the operation and releases the captured context
+in a `finally`, so a throwing logging provider cannot strand it in the registry.
+
