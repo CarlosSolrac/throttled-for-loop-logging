@@ -45,6 +45,8 @@ just overwrite each other.
 When the host shuts down, disposing `OperationLogger` writes out every operation still running:
 its held events, then one line (event id **9008**) saying it was still running, with the counts it
 had reached. If that is an operation's last line, the process died before the operation finished.
+An operation whose logging provider is hung on another thread is skipped after a few seconds and
+reported as event 9009, so one stuck provider cannot hold up shutdown or the other operations.
 
 ## What survives a restart, by trigger
 

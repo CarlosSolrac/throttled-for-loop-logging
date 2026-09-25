@@ -798,3 +798,12 @@ pass raised this). A logging provider, which is called under the lock, must not 
 the same operation to end. `End` retires the operation and releases the captured context
 in a `finally`, so a throwing logging provider cannot strand it in the registry.
 
+Shutdown is bounded against a provider that hangs on another thread. `Dispose` first flushes every
+operation whose lock is free, then waits for the busy ones, sharing one five-second budget between
+them; an operation still locked after that is skipped and reported as event 9009. A provider that
+hangs on the disposing thread itself still hangs `Dispose`, since a synchronous call cannot be
+abandoned. `BeginOperation` checks for disposal and registers the operation under the same lock
+`Dispose` marks the logger disposed under, and holds the operation's lock until its entry line is
+written, so an operation begun during shutdown is either refused or flushed after its entry line.
+A sweep that throws is caught per operation and logged as event 9012, so the sweeper keeps running.
+

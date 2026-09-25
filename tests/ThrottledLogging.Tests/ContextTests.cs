@@ -573,6 +573,109 @@ public sealed class ContextTests
         Assert.Contains(provider.Lines, l => l.EventId == 9004 && l.Category.EndsWith(".Broken", StringComparison.Ordinal) && l.Message.Contains("order-2", StringComparison.Ordinal));
     }
 
+    [Fact]
+    public void Dispose_gives_up_on_an_operation_a_hung_provider_holds_and_still_flushes_the_others()
+    {
+        // The provider hangs on the Stuck operation's heartbeat until the test releases it, the way
+        // a provider blocked on a dead network connection would.
+        using ManualResetEventSlim release = new(initialState: false);
+        using ManualResetEventSlim hung = new(initialState: false);
+        bool hangNow = false;
+        using RecordingProvider provider = new()
+        {
+            AfterLine = l =>
+            {
+                if (Volatile.Read(ref hangNow) && l.EventId == 9004 && l.Category.EndsWith(".Stuck", StringComparison.Ordinal))
+                {
+                    hung.Set();
+                    release.Wait(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+                }
+            },
+        };
+        using ILoggerFactory factory = LoggerFactory.Create(builder => builder.AddProvider(provider));
+        FakeTimeProvider time = new(new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero));
+        OperationLogger logger = new(factory, new ThrottledLoggingOptions { EnableSweeper = false }, time) { ShutdownLockTimeout = TimeSpan.FromMilliseconds(200) };
+        IOperationScope stuck = logger.BeginOperation("Stuck");
+        IOperationScope healthy = logger.BeginOperation("Healthy");
+        using (IItemScope first = stuck.BeginItem("order-1"))
+        {
+            first.Success();
+        }
+
+        using (IItemScope held = stuck.BeginItem("order-2"))
+        {
+            held.Success();                                              // held, for the sweep to write
+        }
+
+        Volatile.Write(ref hangNow, true);
+        time.Advance(TimeSpan.FromMinutes(1));
+        Thread sweeper = new(logger.SweepOnce) { IsBackground = true };
+        sweeper.Start();
+        Assert.True(hung.Wait(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken));   // the sweep now holds Stuck's lock
+
+        Stopwatch elapsed = Stopwatch.StartNew();
+        logger.Dispose();
+        elapsed.Stop();
+
+        Assert.True(elapsed.Elapsed < TimeSpan.FromSeconds(10), $"Dispose took {elapsed.Elapsed}.");
+        Assert.Single(provider.Lines, l => l.EventId == 9008 && l.Category.EndsWith(".Healthy", StringComparison.Ordinal));
+        Assert.Single(provider.Lines, l => l.EventId == 9009 && l.Message.Contains("Stuck", StringComparison.Ordinal));
+        release.Set();
+        Assert.True(sweeper.Join(TimeSpan.FromSeconds(10)));
+        stuck.Dispose();
+        healthy.Dispose();
+    }
+
+    [Fact]
+    public void Dispose_while_an_operation_is_writing_its_entry_line_flushes_it_after_that_line()
+    {
+        // The entry line blocks until the test has started Dispose, so Dispose finds the operation
+        // registered but not yet started: the window the registry lock and entry lock close.
+        using ManualResetEventSlim entering = new(initialState: false);
+        using ManualResetEventSlim release = new(initialState: false);
+        using RecordingProvider provider = new()
+        {
+            AfterLine = l =>
+            {
+                if (l.EventId == 9000)
+                {
+                    entering.Set();
+                    release.Wait(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+                }
+            },
+        };
+        using ILoggerFactory factory = LoggerFactory.Create(builder => builder.AddProvider(provider));
+        OperationLogger logger = new(factory, new ThrottledLoggingOptions { EnableSweeper = false }, TimeProvider.System);
+
+        IOperationScope? late = null;
+        Thread begin = new(() => late = logger.BeginOperation("Late")) { IsBackground = true };
+        begin.Start();
+        Assert.True(entering.Wait(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken));
+        Thread dispose = new(logger.Dispose) { IsBackground = true };
+        dispose.Start();
+
+        // Dispose must wait for the entry line rather than write "still running" ahead of it.
+        Assert.False(dispose.Join(TimeSpan.FromMilliseconds(300)));
+        release.Set();
+        Assert.True(dispose.Join(TimeSpan.FromSeconds(10)));
+        Assert.True(begin.Join(TimeSpan.FromSeconds(10)));
+        Assert.NotNull(late);
+        late.Dispose();
+
+        List<int> ids = [.. provider.Lines.Select(static l => l.EventId)];
+        Assert.Equal([9000, 9008, 9003], ids);
+    }
+
+    [Fact]
+    public void Begin_after_dispose_is_refused()
+    {
+        using ILoggerFactory factory = LoggerFactory.Create(static _ => { });
+        OperationLogger logger = new(factory, new ThrottledLoggingOptions { EnableSweeper = false }, TimeProvider.System);
+        logger.Dispose();
+
+        Assert.Throws<ObjectDisposedException>(() => logger.BeginOperation("TooLate"));
+    }
+
     /// <summary>
     /// Begins an operation on another thread whose context holds a large object in an AsyncLocal,
     /// and returns the operation with a weak reference to that object. Nothing on the test's own

@@ -9,7 +9,6 @@ internal sealed class OperationScope : IOperationScope
     // ExecutionContext.Run takes a static callback plus a state object; these avoid allocating a
     // closure on every sweep.
     private static readonly ContextCallback SweepCallback = static state => ((OperationScope)state!).SweepCore();
-    private static readonly ContextCallback ShutdownCallback = static state => ((OperationScope)state!).FlushForShutdownCore();
 
     private readonly OperationLogger _owner;
     private readonly ILogger _logger;
@@ -172,6 +171,28 @@ internal sealed class OperationScope : IOperationScope
         Log.OperationStarted(_logger, _options.Level, Name, Id, _options.TotalItems);
     }
 
+    /// <summary>
+    /// Takes the lifecycle lock for <see cref="OperationLogger.BeginOperation"/>, which holds it from
+    /// registration until the entry line is written, so a shutdown flush that finds the operation
+    /// registered waits for its entry line instead of writing "still running" ahead of it.
+    /// </summary>
+    /// <remarks>Instant: nothing else can see the operation before it is registered.</remarks>
+    public void EnterForEntry() => Monitor.Enter(_lifecycleGate);
+
+    /// <summary>Releases the lock taken by <see cref="EnterForEntry"/>.</summary>
+    public void ExitAfterEntry() => Monitor.Exit(_lifecycleGate);
+
+    /// <summary>
+    /// Marks an operation whose entry line threw as ended without writing anything, and lets go of
+    /// the caller's context. The caller never received it, so nothing else could ever end it, and a
+    /// shutdown flush already waiting on it must find nothing to write.
+    /// </summary>
+    public void Abandon()
+    {
+        Volatile.Write(ref _ended, 1);
+        Volatile.Write(ref _callerContext, null);
+    }
+
     /// <summary>Records the outcome of one item. Called by <see cref="ItemScope"/>.</summary>
     /// <param name="id">The in-flight identifier.</param>
     /// <param name="label">The item label.</param>
@@ -228,16 +249,26 @@ internal sealed class OperationScope : IOperationScope
     /// follows. If the process dies first, the shutdown line is the operation's last word, with
     /// the counts it had reached.
     /// </remarks>
-    public void FlushForShutdown()
+    /// <param name="lockTimeout">
+    /// How long to wait for the lifecycle lock. Another thread holds it while writing this
+    /// operation's lines, and a logging provider that hangs there would otherwise hang shutdown.
+    /// </param>
+    /// <returns>
+    /// <see langword="false"/> when the lock could not be taken in time, so nothing was written;
+    /// <see langword="true"/> otherwise, including when the operation had already ended.
+    /// </returns>
+    public bool FlushForShutdown(TimeSpan lockTimeout)
     {
         if (HasEnded)
         {
-            return;
+            return true;
         }
 
         // Dispose runs on whatever thread the host disposes on, often inside some unrelated
         // invocation's scope. An operation that captured nothing must not borrow that.
-        RunInCallerContext(ShutdownCallback, isolateWhenUncaptured: true);
+        bool flushed = false;
+        RunInCallerContext(state => flushed = ((OperationScope)state!).FlushForShutdownCore(lockTimeout), isolateWhenUncaptured: true);
+        return flushed;
     }
 
     /// <summary>Runs <paramref name="callback"/> in the context captured at BeginOperation.</summary>
@@ -268,18 +299,29 @@ internal sealed class OperationScope : IOperationScope
         CleanContext.RunAndWait(() => callback(this));
     }
 
-    private void FlushForShutdownCore()
+    /// <param name="lockTimeout">How long to wait for the lifecycle lock.</param>
+    /// <returns>Whether the lock was taken.</returns>
+    private bool FlushForShutdownCore(TimeSpan lockTimeout)
     {
         List<ThrottledEvent> deferred = [];
+        bool taken = false;
         try
         {
-            lock (_lifecycleGate)
+            Monitor.TryEnter(_lifecycleGate, lockTimeout, ref taken);
+            if (taken)
             {
                 FlushForShutdownLocked(deferred);
             }
+
+            return taken;
         }
         finally
         {
+            if (taken)
+            {
+                Monitor.Exit(_lifecycleGate);
+            }
+
             NotifyDeferred(deferred);
         }
     }

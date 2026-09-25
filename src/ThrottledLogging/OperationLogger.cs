@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Runtime.ExceptionServices;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -21,6 +22,10 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
     // Guards starting and stopping the sweeper, which a reload can do at any time.
     private readonly object _sweeperGate = new();
 
+    // Orders registration against Dispose: an operation is either registered before Dispose
+    // marks the logger disposed, and so flushed by it, or refused with ObjectDisposedException.
+    private readonly object _registryGate = new();
+
     // Replaced whole when configuration reloads; read with Volatile.Read through Current.
     private Settings _settings;
 
@@ -41,6 +46,12 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
     private long _completedOperations;
     private long _failedOperations;
     private int _disposed;
+
+    /// <summary>
+    /// How long <see cref="Dispose"/> waits, in total, for operations whose lock another thread is
+    /// holding (usually because a logging provider is slow or hung) before giving up on them.
+    /// </summary>
+    internal TimeSpan ShutdownLockTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
     /// Creates the logger for dependency injection, following configuration as it changes. This is
@@ -128,6 +139,8 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
     public IOperationScope BeginOperation(string name, OperationOptions? options = null)
     {
         ArgumentNullException.ThrowIfNull(name);
+
+        // A cheap early refusal; the authoritative check is under the registry lock below.
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
         OperationOptions effective = (options ?? Current.Defaults).Clone();
@@ -137,8 +150,18 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
         OperationScope scope = new(this, logger, name, effective, _time);
 
         // Registered before the entry line, so a snapshot taken from another thread the instant
-        // that line appears already sees the operation.
-        _active[scope.Id] = scope;
+        // that line appears already sees the operation. The check and the registration happen under
+        // the lock Dispose marks the logger disposed under, so an operation begun while Dispose runs
+        // is either refused or registered in time to be flushed. The operation's own lifecycle lock
+        // is taken before the registry lock is released and held until the entry line is written,
+        // so a shutdown flush never writes "still running" ahead of "started".
+        lock (_registryGate)
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+            _active[scope.Id] = scope;
+            scope.EnterForEntry();
+        }
+
         try
         {
             scope.LogEntry();
@@ -147,8 +170,14 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
         {
             // The caller never receives the scope, so nothing could ever end it: take it back out
             // of the registry rather than leave it (and the context it captured) there for good.
+            // Abandoning it also tells a shutdown flush waiting on it that there is nothing to write.
             _active.TryRemove(scope.Id, out _);
+            scope.Abandon();
             throw;
+        }
+        finally
+        {
+            scope.ExitAfterEntry();
         }
 
         return scope;
@@ -243,9 +272,12 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
     /// </remarks>
     public void Dispose()
     {
-        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        lock (_registryGate)
         {
-            return;
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            {
+                return;
+            }
         }
 
         // First, so no reload can start a sweeper after the one below has been stopped. Reload
@@ -277,10 +309,10 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
         if (!sweeperStopped)
         {
             // A provider or an OnEmitted callback is blocking the sweeper mid-emission. The flush
-            // below is still safe to run alongside it: each operation's sweep and shutdown flush
-            // take the same lock, and a final flush waits for the channel rather than skipping. What
-            // cannot be promised is that the sweeper's own line reaches its provider before the
-            // host disposes that provider.
+            // below still runs: each operation's sweep and shutdown flush take the same lock, so they
+            // cannot interleave, and FlushAtShutdown gives up on an operation whose lock stays held
+            // rather than hang behind it. What cannot be promised is that the sweeper's own line
+            // reaches its provider before the host disposes that provider.
             IgnoreFailure(() => Log.SweeperDidNotStop(_selfLogger));
         }
         else
@@ -288,20 +320,80 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
             stop?.Dispose();
         }
 
+        FlushAtShutdown();
+    }
+
+    /// <summary>
+    /// Flushes every registered operation, without letting one whose lock another thread holds
+    /// delay the rest or hang shutdown.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The first pass flushes every operation whose lock is free right now and sets the busy ones
+    /// aside. The second waits for those, sharing one <see cref="ShutdownLockTimeout"/> budget
+    /// between them, so a hung provider costs the whole shutdown that long at most, not that long
+    /// per operation. An operation still busy after that is reported as event 9009 and skipped.
+    /// </para>
+    /// <para>
+    /// Nothing is registered after this starts: Dispose marked the logger disposed under the
+    /// registry lock, so the enumeration below sees every operation it has to.
+    /// </para>
+    /// <para>
+    /// This bounds only the wait for another thread. A provider that hangs while this thread is
+    /// writing to it hangs here too; no synchronous call can be abandoned part way through.
+    /// </para>
+    /// </remarks>
+    private void FlushAtShutdown()
+    {
+        List<OperationScope> busy = [];
         foreach (OperationScope scope in _active.Values)
         {
-            try
+            if (!TryFlushAtShutdown(scope, TimeSpan.Zero))
             {
-                scope.FlushForShutdown();
+                busy.Add(scope);
             }
+        }
+
+        if (busy.Count == 0)
+        {
+            return;
+        }
+
+        long deadline = Stopwatch.GetTimestamp() + (long)(ShutdownLockTimeout.TotalSeconds * Stopwatch.Frequency);
+        foreach (OperationScope scope in busy)
+        {
+            TimeSpan remaining = Stopwatch.GetElapsedTime(Stopwatch.GetTimestamp(), deadline);
+            if (remaining < TimeSpan.Zero)
+            {
+                remaining = TimeSpan.Zero;
+            }
+
+            if (!TryFlushAtShutdown(scope, remaining))
+            {
+                TimeoutException timeout = new($"Another thread held the operation for longer than {ShutdownLockTimeout.TotalSeconds:N1}s, most likely a logging provider that is not returning; its held events were not written.");
+                IgnoreFailure(() => Log.ShutdownFlushFailed(_selfLogger, timeout, scope.Name, scope.Id));
+            }
+        }
+    }
+
+    /// <summary>Flushes one operation at shutdown, reporting rather than throwing any failure.</summary>
+    /// <param name="scope">The operation.</param>
+    /// <param name="lockTimeout">How long to wait for its lock.</param>
+    /// <returns><see langword="false"/> only when its lock could not be taken in time.</returns>
+    private bool TryFlushAtShutdown(OperationScope scope, TimeSpan lockTimeout)
+    {
+        try
+        {
+            return scope.FlushForShutdown(lockTimeout);
+        }
 #pragma warning disable CA1031 // One misbehaving logging provider must not stop the others being flushed, nor throw out of Dispose.
-            catch (Exception error)
+        catch (Exception error)
 #pragma warning restore CA1031
-            {
-                // Reported through the same factory, which may be the thing that is failing, so
-                // the report is best-effort too.
-                IgnoreFailure(() => Log.ShutdownFlushFailed(_selfLogger, error, scope.Name, scope.Id));
-            }
+        {
+            // Reported through the same factory, which may be the thing that is failing, so
+            // the report is best-effort too.
+            IgnoreFailure(() => Log.ShutdownFlushFailed(_selfLogger, error, scope.Name, scope.Id));
+            return true;
         }
     }
 
