@@ -1157,7 +1157,8 @@ for long runs.
   properties only gained `OperationId`, and every event id is unchanged.
 - **New events:** 9008 (still running at shutdown, Warning), 9009 (a shutdown flush failed,
   Warning), 9010 (the sweeper did not stop within five seconds, Warning), 9011 (reloaded settings
-  were rejected, Warning).
+  were rejected, Warning), 9012 (a logging provider threw while the sweeper wrote a held line, Warning;
+  that line is lost, but the sweeper keeps running where it used to stop for good).
 - **New API:** `OperationOptions.Scope`; `AddThrottledLogging(IConfiguration, Action<ThrottledLoggingOptions>?)`
   to bind settings from configuration and follow reloads; an `OperationLogger` constructor taking
   `IOptionsMonitor<ThrottledLoggingOptions>`. Nothing was removed and no default changed.

@@ -531,6 +531,48 @@ public sealed class ContextTests
         healthy.Dispose();
     }
 
+    [Fact]
+    public void A_provider_that_throws_during_a_sweep_does_not_stop_the_sweep_for_other_operations()
+    {
+        // The provider starts failing only once both held lines exist, so only the sweep is affected.
+        bool failing = false;
+        using RecordingProvider provider = new() { ThrowWhen = l => failing && l.EventId == 9004 && l.Category.EndsWith(".Broken", StringComparison.Ordinal) };
+        using ILoggerFactory factory = LoggerFactory.Create(builder => builder.AddProvider(provider));
+        FakeTimeProvider time = new(new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero));
+        using OperationLogger logger = new(factory, new ThrottledLoggingOptions { EnableSweeper = false }, time);
+        using IOperationScope broken = logger.BeginOperation("Broken");
+        using IOperationScope healthy = logger.BeginOperation("Healthy");
+        foreach (IOperationScope operation in new[] { broken, healthy })
+        {
+            using (IItemScope first = operation.BeginItem("order-1"))    // logged: the first event
+            {
+                first.Success();                                          // held
+            }
+        }
+
+        failing = true;
+        time.Advance(TimeSpan.FromMinutes(1));
+        provider.Clear();
+        Exception? thrown = Record.Exception(logger.SweepOnce);
+
+        Assert.Null(thrown);
+        Assert.Single(provider.Lines, l => l.EventId == 9004 && l.Category.EndsWith(".Healthy", StringComparison.Ordinal));
+        Assert.Single(provider.Lines, l => l.EventId == 9012);
+
+        // The line that failed is not retried, but once the provider recovers the operation's next
+        // held event is swept as usual: the failure did not leave the operation stuck.
+        failing = false;
+        using (IItemScope second = broken.BeginItem("order-2"))
+        {
+            second.Success();
+        }
+
+        time.Advance(TimeSpan.FromMinutes(1));
+        provider.Clear();
+        logger.SweepOnce();
+        Assert.Contains(provider.Lines, l => l.EventId == 9004 && l.Category.EndsWith(".Broken", StringComparison.Ordinal) && l.Message.Contains("order-2", StringComparison.Ordinal));
+    }
+
     /// <summary>
     /// Begins an operation on another thread whose context holds a large object in an AsyncLocal,
     /// and returns the operation with a weak reference to that object. Nothing on the test's own

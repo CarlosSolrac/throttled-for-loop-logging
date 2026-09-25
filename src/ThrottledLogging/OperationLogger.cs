@@ -322,11 +322,28 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
     }
 
     /// <summary>Runs one sweep across every active operation. Exposed so tests need no background timer.</summary>
+    /// <remarks>
+    /// A logging provider that throws while one operation's held line is written must not stop the
+    /// sweep for the others, nor fault the background loop: an unhandled exception there would end
+    /// the loop for good and leave every later heartbeat unwritten. The failure is reported as
+    /// event 9012 and the sweep moves on. The line that failed is not retried; the operation's next
+    /// held event is swept as usual.
+    /// </remarks>
     internal void SweepOnce()
     {
         foreach (OperationScope scope in _active.Values)
         {
-            scope.Sweep();
+            try
+            {
+                scope.Sweep();
+            }
+#pragma warning disable CA1031 // A provider may throw anything; the sweeper must survive it.
+            catch (Exception error)
+#pragma warning restore CA1031
+            {
+                // Reported through the same factory, which may be the thing that is failing.
+                IgnoreFailure(() => Log.SweepFailed(_selfLogger, error, scope.Name, scope.Id));
+            }
         }
     }
 
