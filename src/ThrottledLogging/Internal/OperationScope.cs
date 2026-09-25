@@ -30,6 +30,18 @@ internal sealed class OperationScope : IOperationScope
     // (System.Threading.Lock would do, but only exists from .NET 9 and this also targets .NET 8.)
     private readonly object _lifecycleGate = new();
 
+    // Observer notifications made while the lifecycle lock is held, handed to the observer by the
+    // outermost holder once it lets go. The lock is reentrant (a logging provider called under it may
+    // end the operation, which takes it again), so an inner holder releasing its own entry must not
+    // deliver them: the outer entry still holds the lock. Only touched by the thread holding the lock.
+    private List<ThrottledEvent>? _heldNotifications;
+
+    // True while BeginOperation holds the lock to write the entry line. A shutdown flush that gets
+    // in then can only be reentrant (a provider disposing the logger from inside the entry line), and
+    // is postponed until that line has gone to every provider. Only touched under the lock.
+    private bool _entryInProgress;
+    private bool _flushAfterEntry;
+
     // The caller's ambient context at BeginOperation: its logging scopes (Microsoft.Extensions.Logging
     // keeps them in an AsyncLocal), Activity.Current (which Application Insights reads for
     // operation_Id), and any other AsyncLocal. Lines written on the caller's own thread have all of
@@ -94,6 +106,12 @@ internal sealed class OperationScope : IOperationScope
 
     /// <summary>Whether the operation has ended.</summary>
     public bool HasEnded => Volatile.Read(ref _ended) != 0;
+
+    /// <summary>Whether the calling thread holds this operation's lifecycle lock. For tests.</summary>
+    internal bool IsLockHeldByCurrentThread => Monitor.IsEntered(_lifecycleGate);
+
+    /// <summary>Whether the operation still holds the caller's captured context. For tests.</summary>
+    internal bool HoldsCallerContext => Volatile.Read(ref _callerContext) is not null;
 
     /// <summary>The shorter of this operation's two time thresholds, which is how often it needs sweeping.</summary>
     public TimeSpan TightestInterval => _options.EveryInterval < _options.FailureEveryInterval ? _options.EveryInterval : _options.FailureEveryInterval;
@@ -177,10 +195,38 @@ internal sealed class OperationScope : IOperationScope
     /// registered waits for its entry line instead of writing "still running" ahead of it.
     /// </summary>
     /// <remarks>Instant: nothing else can see the operation before it is registered.</remarks>
-    public void EnterForEntry() => Monitor.Enter(_lifecycleGate);
+    public void EnterForEntry()
+    {
+        Monitor.Enter(_lifecycleGate);
+        _entryInProgress = true;
+    }
 
-    /// <summary>Releases the lock taken by <see cref="EnterForEntry"/>.</summary>
-    public void ExitAfterEntry() => Monitor.Exit(_lifecycleGate);
+    /// <summary>
+    /// Releases the lock taken by <see cref="EnterForEntry"/>, first running a shutdown flush that a
+    /// provider asked for from inside the entry line.
+    /// </summary>
+    public void ExitAfterEntry()
+    {
+        try
+        {
+            _entryInProgress = false;
+            if (_flushAfterEntry)
+            {
+                _flushAfterEntry = false;
+                FlushForShutdownLocked();
+            }
+        }
+#pragma warning disable CA1031 // Runs in BeginOperation's finally; a provider failure here must not replace its outcome.
+        catch (Exception error)
+#pragma warning restore CA1031
+        {
+            _owner.ReportShutdownFlushFailed(this, error);
+        }
+        finally
+        {
+            ExitLock(outermost: true);
+        }
+    }
 
     /// <summary>
     /// Marks an operation whose entry line threw as ended without writing anything, and lets go of
@@ -202,6 +248,16 @@ internal sealed class OperationScope : IOperationScope
     public void CompleteItem(long id, string? label, bool succeeded, Exception? error, long startTimestamp)
     {
         _inFlight.TryRemove(id, out _);
+
+        // An item finished after its operation ended (the caller ended the operation with the item
+        // still open) has nowhere to go: the closing lines are written and the operation's counts
+        // already folded into the logger's totals. It is dropped rather than held for a flush that will
+        // never come. An item finishing at the same instant the operation ends may still slip past this
+        // check; ending an operation while its items are still running is a caller error either way.
+        if (HasEnded)
+        {
+            return;
+        }
 
         // Every completed item feeds the predictive statistics, whatever its outcome: an ETA
         // predicts wall-clock, and a failure consumed just as much of it as a success. See the
@@ -274,9 +330,8 @@ internal sealed class OperationScope : IOperationScope
     /// <summary>Runs <paramref name="callback"/> in the context captured at BeginOperation.</summary>
     /// <param name="callback">The work, called with this operation as its state.</param>
     /// <param name="isolateWhenUncaptured">
-    /// When nothing was captured, run on a thread-pool thread with flow suppressed, so the work
-    /// sees no ambient context at all rather than the current thread's. Blocks until it is done;
-    /// only used at shutdown, where blocking is expected.
+    /// When nothing was captured, run in the empty context, so the work sees no ambient context at
+    /// all rather than the current thread's. Runs on the calling thread either way.
     /// </param>
     private void RunInCallerContext(ContextCallback callback, bool isolateWhenUncaptured)
     {
@@ -296,37 +351,69 @@ internal sealed class OperationScope : IOperationScope
             return;
         }
 
-        CleanContext.RunAndWait(() => callback(this));
+        ExecutionContext.Run(CleanContext.Empty, callback, this);
     }
 
     /// <param name="lockTimeout">How long to wait for the lifecycle lock.</param>
     /// <returns>Whether the lock was taken.</returns>
     private bool FlushForShutdownCore(TimeSpan lockTimeout)
     {
-        List<ThrottledEvent> deferred = [];
+        bool outermost = !Monitor.IsEntered(_lifecycleGate);
         bool taken = false;
+        Monitor.TryEnter(_lifecycleGate, lockTimeout, ref taken);
+        if (!taken)
+        {
+            return false;
+        }
+
         try
         {
-            Monitor.TryEnter(_lifecycleGate, lockTimeout, ref taken);
-            if (taken)
+            if (_entryInProgress)
             {
-                FlushForShutdownLocked(deferred);
+                // Only this thread can be inside the entry line while holding the lock, so this is
+                // a provider disposing the logger from inside it. Writing now would put "still
+                // running" ahead of "started" for every provider after this one.
+                _flushAfterEntry = true;
+                return true;
             }
 
-            return taken;
+            FlushForShutdownLocked();
+            return true;
         }
         finally
         {
-            if (taken)
-            {
-                Monitor.Exit(_lifecycleGate);
-            }
-
-            NotifyDeferred(deferred);
+            ExitLock(outermost);
         }
     }
 
-    private void FlushForShutdownLocked(List<ThrottledEvent> deferred)
+    /// <summary>Takes the lifecycle lock.</summary>
+    /// <returns>Whether this is the outermost entry on this thread, which must pass it to <see cref="ExitLock"/>.</returns>
+    private bool EnterLock()
+    {
+        bool outermost = !Monitor.IsEntered(_lifecycleGate);
+        Monitor.Enter(_lifecycleGate);
+        return outermost;
+    }
+
+    /// <summary>
+    /// Releases one entry of the lifecycle lock. The outermost entry also hands over the observer
+    /// notifications made while it was held, once the lock is no longer held.
+    /// </summary>
+    /// <param name="outermost">What <see cref="EnterLock"/> returned.</param>
+    private void ExitLock(bool outermost)
+    {
+        List<ThrottledEvent>? held = null;
+        if (outermost)
+        {
+            held = _heldNotifications;
+            _heldNotifications = null;
+        }
+
+        Monitor.Exit(_lifecycleGate);
+        NotifyDeferred(held);
+    }
+
+    private void FlushForShutdownLocked()
     {
         if (HasEnded)
         {
@@ -335,12 +422,12 @@ internal sealed class OperationScope : IOperationScope
 
         if (Progress.Flush() is { } heldProgress)
         {
-            Emit(heldProgress, _options.Level, deferred);
+            Emit(heldProgress, _options.Level);
         }
 
         if (Failures.Flush() is { } heldFailure)
         {
-            Emit(heldFailure, _options.FailureLevel, deferred);
+            Emit(heldFailure, _options.FailureLevel);
         }
 
         // A logging provider can end the operation while writing the lines above: it runs on this
@@ -366,30 +453,27 @@ internal sealed class OperationScope : IOperationScope
 
     private void SweepCore()
     {
-        List<ThrottledEvent> deferred = [];
+        bool outermost = EnterLock();
         try
         {
-            lock (_lifecycleGate)
+            if (HasEnded)
             {
-                if (HasEnded)
-                {
-                    return;
-                }
+                return;
+            }
 
-                if (Progress.TryFlushDueToTime() is { } progress)
-                {
-                    Emit(progress, _options.Level, deferred);
-                }
+            if (Progress.TryFlushDueToTime() is { } progress)
+            {
+                Emit(progress, _options.Level);
+            }
 
-                if (Failures.TryFlushDueToTime() is { } failure)
-                {
-                    Emit(failure, _options.FailureLevel, deferred);
-                }
+            if (Failures.TryFlushDueToTime() is { } failure)
+            {
+                Emit(failure, _options.FailureLevel);
             }
         }
         finally
         {
-            NotifyDeferred(deferred);
+            ExitLock(outermost);
         }
     }
 
@@ -421,11 +505,12 @@ internal sealed class OperationScope : IOperationScope
     /// <summary>Writes one emission and tells the <c>OnEmitted</c> observer about it.</summary>
     /// <param name="emission">What the channel released.</param>
     /// <param name="level">The level to write at.</param>
-    /// <param name="deferred">
-    /// When the caller holds the lifecycle lock, the list to add the observer notification to
-    /// instead of making it now; the caller makes it once the lock is released. See <see cref="NotifyDeferred"/>.
-    /// </param>
-    private void Emit(in Emission emission, LogLevel level, List<ThrottledEvent>? deferred = null)
+    /// <remarks>
+    /// When this thread holds the lifecycle lock (a sweep, a shutdown flush, the end, or a provider
+    /// called from any of those re-entering the operation), the observer notification is held until
+    /// the outermost entry lets go. See <see cref="NotifyDeferred"/>.
+    /// </remarks>
+    private void Emit(in Emission emission, LogLevel level)
     {
         OperationSnapshot snapshot = Snapshot();
         PendingEvent pending = emission.Event;
@@ -452,13 +537,13 @@ internal sealed class OperationScope : IOperationScope
             Progress = snapshot,
         };
 
-        if (deferred is null)
+        if (Monitor.IsEntered(_lifecycleGate))
         {
-            _owner.NotifyEmitted(emitted);
+            (_heldNotifications ??= []).Add(emitted);
         }
         else
         {
-            deferred.Add(emitted);
+            _owner.NotifyEmitted(emitted);
         }
     }
 
@@ -553,49 +638,46 @@ internal sealed class OperationScope : IOperationScope
 
     private void End(Exception? error, string? note, bool? succeeded)
     {
-        List<ThrottledEvent> deferred = [];
+        bool outermost = EnterLock();
         try
         {
-            lock (_lifecycleGate)
+            if (Interlocked.Exchange(ref _ended, 1) != 0)
             {
-                if (Interlocked.Exchange(ref _ended, 1) != 0)
-                {
-                    return;
-                }
+                return;
+            }
 
-                try
-                {
-                    WriteClosingLines(error, note, succeeded, deferred);
-                }
-                finally
-                {
-                    // Whatever the logging providers did above, the operation leaves the registry
-                    // and lets go of the caller's context. Otherwise one throwing provider would
-                    // strand it in the singleton for the life of the process, already marked ended
-                    // so that no second Dispose could retire it.
-                    Volatile.Write(ref _callerContext, null);
-                    _owner.Retire(this, succeeded ?? false);
-                }
+            try
+            {
+                WriteClosingLines(error, note, succeeded);
+            }
+            finally
+            {
+                // Whatever the logging providers did above, the operation leaves the registry
+                // and lets go of the caller's context. Otherwise one throwing provider would
+                // strand it in the singleton for the life of the process, already marked ended
+                // so that no second Dispose could retire it.
+                Volatile.Write(ref _callerContext, null);
+                _owner.Retire(this, succeeded ?? false);
             }
         }
         finally
         {
-            NotifyDeferred(deferred);
+            ExitLock(outermost);
         }
     }
 
-    private void WriteClosingLines(Exception? error, string? note, bool? succeeded, List<ThrottledEvent> deferred)
+    private void WriteClosingLines(Exception? error, string? note, bool? succeeded)
     {
         // Whatever is still held goes out before the closing line, so a run that ends badly never
         // hides its most recent failure.
         if (Progress.Flush() is { } heldProgress)
         {
-            Emit(heldProgress, _options.Level, deferred);
+            Emit(heldProgress, _options.Level);
         }
 
         if (Failures.Flush() is { } heldFailure)
         {
-            Emit(heldFailure, _options.FailureLevel, deferred);
+            Emit(heldFailure, _options.FailureLevel);
         }
 
         OperationSnapshot snapshot = Snapshot();

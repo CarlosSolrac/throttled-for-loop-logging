@@ -1,8 +1,10 @@
+using System.Diagnostics;
 using System.Text;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Testing;
+using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Time.Testing;
 
 namespace ThrottledLogging.Tests;
@@ -176,7 +178,10 @@ public sealed class ConfigurationTests
         // The sweeper that was switched on produces a heartbeat for a held event.
         using IOperationScope operation = host.Logger.BeginOperation("ImportOrders");
         RunItem(operation, "order-1");   // Started: the first event, written; Succeeded: held.
-        for (int i = 0; i < 100 && !host.Emitted.Any(e => e.Outcome == ItemOutcome.Succeeded); i++)
+        // The sweeper runs on its own thread, so the test cannot step it directly; it keeps the fake
+        // clock moving until the heartbeat appears, with a generous real-time bound for slow machines.
+        Stopwatch waited = Stopwatch.StartNew();
+        while (!host.Emitted.Any(e => e.Outcome == ItemOutcome.Succeeded) && waited.Elapsed < TimeSpan.FromSeconds(30))
         {
             host.Time.Advance(TimeSpan.FromSeconds(1));
             await Task.Delay(20, TestContext.Current.CancellationToken);
@@ -204,6 +209,24 @@ public sealed class ConfigurationTests
         host.Dispose();
     }
 
+    [Fact]
+    public void A_change_callback_handed_stale_settings_still_applies_the_current_ones()
+    {
+        // Two reloads racing: the callback for an older change runs after the one for the newer
+        // change, handing over the older value. The newest settings must stay in force.
+        StubMonitor monitor = new(new ThrottledLoggingOptions { EnableSweeper = false, Defaults = new OperationOptions { EveryItems = 1 } });
+        using ILoggerFactory factory = LoggerFactory.Create(static _ => { });
+        using OperationLogger logger = new(factory, monitor, TimeProvider.System);
+
+        ThrottledLoggingOptions older = new() { EnableSweeper = false, Defaults = new OperationOptions { EveryItems = 2 } };
+        ThrottledLoggingOptions newer = new() { EnableSweeper = false, Defaults = new OperationOptions { EveryItems = 3 } };
+        monitor.CurrentValue = newer;
+        monitor.Raise(newer);
+        monitor.Raise(older);
+
+        Assert.Equal(3, logger.DefaultOptions.EveryItems);
+    }
+
     private static void RunItem(IOperationScope operation, string label)
     {
         using IItemScope item = operation.BeginItem(label);
@@ -215,6 +238,24 @@ public sealed class ConfigurationTests
         => new ConfigurationBuilder()
             .AddInMemoryCollection(settings.Select(static s => new KeyValuePair<string, string?>("ThrottledLogging:" + s.Key, s.Value)))
             .Build();
+
+    /// <summary>An options monitor whose change callbacks the test raises by hand, with any value.</summary>
+    private sealed class StubMonitor(ThrottledLoggingOptions initial) : IOptionsMonitor<ThrottledLoggingOptions>
+    {
+        private Action<ThrottledLoggingOptions, string?>? _listener;
+
+        public ThrottledLoggingOptions CurrentValue { get; set; } = initial;
+
+        public ThrottledLoggingOptions Get(string? name) => CurrentValue;
+
+        public IDisposable? OnChange(Action<ThrottledLoggingOptions, string?> listener)
+        {
+            _listener = listener;
+            return null;
+        }
+
+        public void Raise(ThrottledLoggingOptions handed) => _listener?.Invoke(handed, Options.DefaultName);
+    }
 
     /// <summary>
     /// A container wired the way a host wires it: AddThrottledLogging bound to the

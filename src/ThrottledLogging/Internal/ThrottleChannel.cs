@@ -115,6 +115,9 @@ internal sealed class ThrottleChannel
         return TryEmit(reason);
     }
 
+    /// <summary>Test seam: runs between the sweeper's checks and its turn at the gate.</summary>
+    internal Action? AfterSweeperCheck { get; set; }
+
     /// <summary>
     /// Writes the held event if its time threshold has elapsed. Called by the background sweeper so
     /// that a loop which has gone quiet still produces a heartbeat.
@@ -141,6 +144,7 @@ internal sealed class ThrottleChannel
             return null;
         }
 
+        AfterSweeperCheck?.Invoke();
         return TryEmit(FlushReason.Sweeper);
     }
 
@@ -232,12 +236,22 @@ internal sealed class ThrottleChannel
             // thread's emission in between. Without it two submitters that both saw the count
             // threshold would write the same event twice, and the second write would be counted as
             // one more emission than there were events.
-            if (reason != FlushReason.Sweeper && pending.Sequence == Interlocked.Read(ref _lastEmittedSequence))
+            long lastSequence = Interlocked.Read(ref _lastEmittedSequence);
+            if (reason == FlushReason.Sweeper)
+            {
+                // The sweeper's own checks ran before the gate too. A submitter may have written a
+                // newer event since, resetting the interval; repeating that event now would be a
+                // heartbeat for a loop that is not stalled at all.
+                if (!HasIntervalElapsed() || (pending.Sequence == lastSequence && pending.Outcome != ItemOutcome.Started))
+                {
+                    return null;
+                }
+            }
+            else if (pending.Sequence == lastSequence)
             {
                 return null;
             }
 
-            long lastSequence = Interlocked.Read(ref _lastEmittedSequence);
             bool isNew = pending.Sequence != lastSequence;
             long suppressed = isNew ? Math.Max(0, pending.Sequence - lastSequence - 1) : 0;
 

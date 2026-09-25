@@ -113,6 +113,8 @@ builder.Services
 
 // 2. Scopes become customDimensions only when the provider includes them. It does by default in
 //    Microsoft.ApplicationInsights.WorkerService 2.x; saying so explicitly guards against a change.
+//    The 2.x provider also always writes the event id as customDimensions.EventId, which the queries
+//    below filter on (9001, 9004, 9008 and so on); it has no switch for that.
 builder.Logging.Services.Configure<ApplicationInsightsLoggerOptions>(options => options.IncludeScopes = true);
 
 // 3. The Application Insights SDK adds a filter rule that drops everything below Warning. Remove
@@ -911,10 +913,15 @@ public sealed class DurableImport
 
         // A deterministic instance id makes the batch id the BusinessKey end to end.
         string instanceId = "import-" + batchId;
+
+        // A repeated request finds the earlier run. One still under way, or one that finished
+        // successfully, is left alone: some Durable backends let a finished instance id be scheduled
+        // again, which would import the batch twice. A run that failed or was terminated is started
+        // again, which is what a retried request is for.
         OrchestrationMetadata? existing = await client.GetInstanceAsync(instanceId, context.CancellationToken);
-        if (existing is { IsRunning: true })
+        if (existing?.RuntimeStatus is OrchestrationRuntimeStatus.Pending or OrchestrationRuntimeStatus.Running or OrchestrationRuntimeStatus.Suspended or OrchestrationRuntimeStatus.Completed)
         {
-            _logger.LogInformation("Import {InstanceId} is already running; not starting another", instanceId);
+            _logger.LogInformation("Import {InstanceId} is already {RuntimeStatus}; not starting another", instanceId, existing.RuntimeStatus);
             return;
         }
 
@@ -1164,6 +1171,13 @@ for long runs.
 - **New API:** `OperationOptions.Scope`; `AddThrottledLogging(IConfiguration, Action<ThrottledLoggingOptions>?)`
   to bind settings from configuration and follow reloads; an `OperationLogger` constructor taking
   `IOptionsMonitor<ThrottledLoggingOptions>`. Nothing was removed and no default changed.
+- **Source compatibility:** `services.AddThrottledLogging(null)` written with a bare `null` no longer
+  compiles, because it now matches both the `Action<ThrottledLoggingOptions>` overload and the new
+  `IConfiguration` one. It only ever threw `ArgumentNullException`; drop the call's argument, or
+  cast the `null`, to pick an overload.
+- **Items that finish late:** an item completed after its operation has ended is now ignored. It
+  used to be counted into a channel no one would flush, and could even write a line after the
+  operation's closing line.
 - **New dependency:** `Microsoft.Extensions.Options.ConfigurationExtensions` 8.0.0 or later, for
   the binding overload.
 - **Settings are copied when `OperationLogger` is built.** Changing a `ThrottledLoggingOptions`

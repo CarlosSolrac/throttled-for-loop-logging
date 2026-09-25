@@ -19,6 +19,12 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
     private readonly ILogger _selfLogger;
     private readonly IDisposable? _reloadSubscription;
 
+    // The source of reloaded settings, and the lock that makes reloads run one at a time. Each
+    // reload reads the monitor's current value under it rather than trusting the value its callback
+    // was handed, so two callbacks racing cannot leave the older settings in force.
+    private readonly IOptionsMonitor<ThrottledLoggingOptions>? _monitor;
+    private readonly object _reloadGate = new();
+
     // Guards starting and stopping the sweeper, which a reload can do at any time.
     private readonly object _sweeperGate = new();
 
@@ -47,6 +53,14 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
     private long _failedOperations;
     private int _disposed;
 
+    // Set once the first Dispose has finished, so a concurrent second call can wait for it rather
+    // than return while the first is still writing to providers its caller may be about to dispose.
+    private readonly ManualResetEventSlim _disposeFinished = new(initialState: false);
+    private int _disposingThreadId;
+
+    /// <summary>How long <see cref="Dispose"/> waits for the background sweeper to stop.</summary>
+    private static readonly TimeSpan SweeperStopTimeout = TimeSpan.FromSeconds(5);
+
     /// <summary>
     /// How long <see cref="Dispose"/> waits, in total, for operations whose lock another thread is
     /// holding (usually because a logging provider is slow or hung) before giving up on them.
@@ -70,17 +84,19 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
     public OperationLogger(ILoggerFactory loggerFactory, IOptionsMonitor<ThrottledLoggingOptions> options, TimeProvider timeProvider)
         : this(loggerFactory, (options ?? throw new ArgumentNullException(nameof(options))).CurrentValue, timeProvider)
     {
+        _monitor = options;
+
         // The monitor reports changes to named instances too; only the unnamed one configures this.
-        _reloadSubscription = options.OnChange((changed, name) =>
+        _reloadSubscription = options.OnChange((_, name) =>
         {
             if (string.IsNullOrEmpty(name))
             {
-                Reload(changed);
+                Reload();
             }
         });
 
         // Catches a change that landed between reading CurrentValue above and subscribing.
-        Reload(options.CurrentValue);
+        Reload();
     }
 
     /// <summary>Creates the logger for dependency injection, with settings fixed at startup.</summary>
@@ -272,14 +288,52 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
     /// </remarks>
     public void Dispose()
     {
+        bool first;
         lock (_registryGate)
         {
-            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            first = Interlocked.Exchange(ref _disposed, 1) == 0;
+            if (first)
             {
-                return;
+                Volatile.Write(ref _disposingThreadId, Environment.CurrentManagedThreadId);
             }
         }
 
+        if (!first)
+        {
+            // Outside the registry lock: a provider the first call is writing to may itself call
+            // BeginOperation, which needs that lock to be refused.
+            WaitForFirstDispose();
+            return;
+        }
+
+        try
+        {
+            DisposeCore();
+        }
+        finally
+        {
+            _disposeFinished.Set();
+        }
+    }
+
+    /// <summary>
+    /// Makes a second <see cref="Dispose"/> return only once the first has finished writing, bounded
+    /// by the longest the first can take waiting on others. The same thread calling again (a logging
+    /// provider disposing the logger from inside the shutdown flush) returns at once: waiting there
+    /// would wait on itself.
+    /// </summary>
+    private void WaitForFirstDispose()
+    {
+        if (Volatile.Read(ref _disposingThreadId) == Environment.CurrentManagedThreadId)
+        {
+            return;
+        }
+
+        _disposeFinished.Wait(SweeperStopTimeout + ShutdownLockTimeout);
+    }
+
+    private void DisposeCore()
+    {
         // First, so no reload can start a sweeper after the one below has been stopped. Reload
         // also checks _disposed under the sweeper gate, which covers a reload already under way.
         IgnoreFailure(() => _reloadSubscription?.Dispose());
@@ -299,7 +353,7 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
         {
             // A loop stopped by an earlier reload is awaited by any loop started after it, so the
             // most recent one finishing means they all have.
-            sweeperStopped = sweeper?.Wait(TimeSpan.FromSeconds(5)) ?? true;
+            sweeperStopped = sweeper?.Wait(SweeperStopTimeout) ?? true;
         }
         catch (AggregateException)
         {
@@ -397,6 +451,12 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
         }
     }
 
+    /// <summary>Reports a shutdown flush that failed somewhere other than <see cref="Dispose"/>'s own loop.</summary>
+    /// <param name="scope">The operation.</param>
+    /// <param name="error">What the logging provider threw.</param>
+    internal void ReportShutdownFlushFailed(OperationScope scope, Exception error)
+        => IgnoreFailure(() => Log.ShutdownFlushFailed(_selfLogger, error, scope.Name, scope.Id));
+
     /// <summary>Runs a diagnostic write that must never throw out of <see cref="Dispose"/>.</summary>
     /// <param name="write">The write.</param>
     private static void IgnoreFailure(Action write)
@@ -489,39 +549,46 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
     }
 
     /// <summary>
-    /// Applies reloaded settings: validated as a whole, then swapped in at once, so no reader ever
-    /// sees half of one version and half of another. Invalid settings are logged and ignored.
-    /// Runs on whatever thread raised the change, so it never waits on the sweeper.
+    /// Applies the monitor's current settings: validated as a whole, then swapped in at once, so no
+    /// reader ever sees half of one version and half of another. Invalid settings are logged and
+    /// ignored. Runs on whatever thread raised the change, so it never waits on the sweeper.
     /// </summary>
-    /// <param name="options">The new settings.</param>
-    private void Reload(ThrottledLoggingOptions options)
+    /// <remarks>
+    /// Reloads run one at a time and each reads the current value itself, rather than the value its
+    /// change callback was handed, so whichever runs last applies the newest settings however the
+    /// callbacks that triggered them were ordered.
+    /// </remarks>
+    private void Reload()
     {
-        Settings next;
-        try
+        lock (_reloadGate)
         {
-            next = Settings.From(options);
-        }
-        catch (Exception error) when (error is ArgumentException or InvalidOperationException)
-        {
-            IgnoreFailure(() => Log.SettingsReloadRejected(_selfLogger, error));
-            return;
-        }
-
-        lock (_sweeperGate)
-        {
-            if (Volatile.Read(ref _disposed) != 0)
+            Settings next;
+            try
             {
+                next = Settings.From(_monitor!.CurrentValue);
+            }
+            catch (Exception error) when (error is ArgumentException or InvalidOperationException)
+            {
+                IgnoreFailure(() => Log.SettingsReloadRejected(_selfLogger, error));
                 return;
             }
 
-            Volatile.Write(ref _settings, next);
-            if (next.EnableSweeper)
+            lock (_sweeperGate)
             {
-                StartSweeper();
-            }
-            else
-            {
-                StopSweeper();
+                if (Volatile.Read(ref _disposed) != 0)
+                {
+                    return;
+                }
+
+                Volatile.Write(ref _settings, next);
+                if (next.EnableSweeper)
+                {
+                    StartSweeper();
+                }
+                else
+                {
+                    StopSweeper();
+                }
             }
         }
     }

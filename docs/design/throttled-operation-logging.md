@@ -807,3 +807,13 @@ abandoned. `BeginOperation` checks for disposal and registers the operation unde
 written, so an operation begun during shutdown is either refused or flushed after its entry line.
 A sweep that throws is caught per operation and logged as event 9012, so the sweeper keeps running.
 
+The lock is reentrant, because a logging provider called under it may end the operation or dispose
+the logger. Observer notifications are therefore held until the outermost holder lets go, not
+just the inner one. A shutdown flush that re-enters from inside the entry line is postponed until
+that line has reached every provider. A second concurrent `Dispose` waits for the first to finish
+(bounded), except on the same thread. An operation that captured no context is flushed in the
+default context on the disposing thread, so shutdown never waits on the thread pool. Reloads run one
+at a time and each reads the monitor's current value, so racing change callbacks cannot restore
+older settings. The sweeper re-checks, under the channel gate, that its interval is still due, so
+it cannot repeat an event a submitter wrote a moment before. An item completed after its operation
+ended is ignored.

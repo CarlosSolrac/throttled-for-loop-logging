@@ -1,8 +1,6 @@
-using System.Runtime.ExceptionServices;
-
 namespace ThrottledLogging.Internal;
 
-/// <summary>Runs work on the thread pool with no ambient context inherited from the caller.</summary>
+/// <summary>Runs work with no ambient context inherited from the caller.</summary>
 internal static class CleanContext
 {
     /// <summary>
@@ -15,8 +13,8 @@ internal static class CleanContext
     /// <see cref="ExecutionContext.SuppressFlow"/> throws when flow is already suppressed, and the
     /// caller may well have done that itself, so it is only called when needed. Only for work that
     /// nobody waits on straight away: a task waited on before it starts can be run inline on the
-    /// waiting thread, in that thread's context. For work that must be waited on, see
-    /// <see cref="RunAndWait"/>.
+    /// waiting thread, in that thread's context. For work that must be waited on, run it in
+    /// <see cref="Empty"/> instead.
     /// </remarks>
     public static Task Start(Func<Task> work)
     {
@@ -32,42 +30,37 @@ internal static class CleanContext
     }
 
     /// <summary>
-    /// Runs <paramref name="work"/> on a thread-pool thread in the default, empty context and blocks
-    /// until it finishes, rethrowing whatever it threw.
+    /// The default execution context: no logging scopes, no <see cref="System.Diagnostics.Activity"/>,
+    /// no AsyncLocal values. <see cref="ExecutionContext.Run"/> runs work in it on the calling thread.
     /// </summary>
-    /// <param name="work">The work.</param>
     /// <remarks>
-    /// Uses <see cref="ThreadPool.UnsafeQueueUserWorkItem(WaitCallback, object?)"/> rather than a
-    /// task: it never flows the caller's context, and unlike a task it can never be inlined onto the
-    /// waiting thread, which would run it in exactly the context this exists to avoid. Thread-pool
-    /// threads return to the default context between work items.
+    /// There is no public way to name the default context, so it is captured once from a thread
+    /// started with flow suppressed, which begins in it. Running in it needs no other thread, so it
+    /// cannot be held up by a starved thread pool at shutdown, and it cannot be inlined into the
+    /// wrong context the way a task waited on before it starts can be.
     /// </remarks>
-    public static void RunAndWait(Action work)
+    public static ExecutionContext Empty { get; } = CaptureEmpty();
+
+    private static ExecutionContext CaptureEmpty()
     {
-        using ManualResetEventSlim done = new(initialState: false);
-        ExceptionDispatchInfo? failure = null;
-
-        ThreadPool.UnsafeQueueUserWorkItem(
-            _ =>
+        ExecutionContext? empty = null;
+        Thread capture = new(() => empty = ExecutionContext.Capture()) { IsBackground = true, Name = "ThrottledLogging context capture" };
+        if (ExecutionContext.IsFlowSuppressed())
+        {
+            capture.Start();
+        }
+        else
+        {
+            using (ExecutionContext.SuppressFlow())
             {
-                try
-                {
-                    work();
-                }
-#pragma warning disable CA1031 // Captured here and rethrown on the waiting thread.
-                catch (Exception error)
-#pragma warning restore CA1031
-                {
-                    failure = ExceptionDispatchInfo.Capture(error);
-                }
-                finally
-                {
-                    done.Set();
-                }
-            },
-            null);
+                capture.Start();
+            }
+        }
 
-        done.Wait();
-        failure?.Throw();
+        capture.Join();
+
+        // Capture only returns null when flow is suppressed on the capturing thread, which a new
+        // thread never starts with.
+        return empty ?? throw new InvalidOperationException("Could not capture the default execution context.");
     }
 }

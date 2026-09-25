@@ -3,6 +3,7 @@ using System.Runtime.CompilerServices;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Testing;
 using Microsoft.Extensions.Time.Testing;
+using ThrottledLogging.Internal;
 
 namespace ThrottledLogging.Tests;
 
@@ -364,17 +365,16 @@ public sealed class ContextTests
     public void An_ended_operation_no_longer_keeps_the_callers_context_alive()
     {
         using TestHarness harness = new();
-        (IOperationScope operation, WeakReference captured) = BeginInsideAContextHoldingABigObject(harness.Logger);
+        using Activity caller = new Activity("ImportOrdersFunction").Start();
+        IOperationScope operation = harness.Logger.BeginOperation("ImportOrders");
+        OperationScope scope = Assert.IsType<OperationScope>(operation);
+        Assert.True(scope.HoldsCallerContext);
 
         operation.Success();
-        GC.Collect();
-        GC.WaitForPendingFinalizers();
-        GC.Collect();
 
-        // The operation itself is still referenced, as a caller holding onto it would; what it
-        // captured must not be.
-        Assert.False(captured.IsAlive);
-        GC.KeepAlive(operation);
+        // The operation itself is still referenced, as a caller holding onto it would be; the
+        // context it captured, and with it every AsyncLocal the caller had set, is let go.
+        Assert.False(scope.HoldsCallerContext);
     }
 
     [Fact]
@@ -667,6 +667,152 @@ public sealed class ContextTests
     }
 
     [Fact]
+    public void Observer_is_not_called_under_the_lock_when_a_provider_ends_the_operation_from_inside_a_sweep()
+    {
+        // The sweep holds the operation's lock while it writes the heartbeat. The provider ends the
+        // operation right there, which takes the (reentrant) lock again and flushes the held failure.
+        // That failure's OnEmitted must wait until the sweep has let go too, not just the inner End.
+        OperationScope? scope = null;
+        List<bool> lockHeldDuringNotification = [];
+        IOperationScope? operation = null;
+        bool ended = false;
+        using RecordingProvider provider = new()
+        {
+            AfterLine = l =>
+            {
+                if (l.EventId == 9004 && l.Message.Contains("order-2", StringComparison.Ordinal) && !ended)
+                {
+                    ended = true;
+                    operation!.Success();
+                }
+            },
+        };
+        using ILoggerFactory factory = LoggerFactory.Create(builder => builder.AddProvider(provider));
+        FakeTimeProvider time = new(new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero));
+        ThrottledLoggingOptions options = new() { EnableSweeper = false, OnEmitted = _ => lockHeldDuringNotification.Add(scope!.IsLockHeldByCurrentThread) };
+        using OperationLogger logger = new(factory, options, time);
+        operation = logger.BeginOperation("ImportOrders");
+        scope = Assert.IsType<OperationScope>(operation);
+        using (IItemScope first = operation.BeginItem("order-1"))
+        {
+            first.Failure(new InvalidOperationException("first"));             // written: first failure
+        }
+
+        using (IItemScope second = operation.BeginItem("order-2"))
+        {
+            second.Failure(new InvalidOperationException("second"));           // held on both channels
+        }
+
+        time.Advance(TimeSpan.FromMinutes(1));
+        lockHeldDuringNotification.Clear();
+        logger.SweepOnce();
+
+        Assert.True(ended);
+        Assert.NotEmpty(lockHeldDuringNotification);
+        Assert.DoesNotContain(true, lockHeldDuringNotification);
+    }
+
+    [Fact]
+    public void Shutdown_flush_of_an_operation_that_captured_nothing_runs_on_the_disposing_thread()
+    {
+        // No thread-pool hop, so a starved pool cannot hold up shutdown.
+        int? flushThread = null;
+        using RecordingProvider provider = new()
+        {
+            AfterLine = l =>
+            {
+                if (l.EventId == 9008)
+                {
+                    flushThread = Environment.CurrentManagedThreadId;
+                }
+            },
+        };
+        using ILoggerFactory factory = LoggerFactory.Create(builder => builder.AddProvider(provider));
+        OperationLogger logger = new(factory, new ThrottledLoggingOptions { EnableSweeper = false }, TimeProvider.System);
+        IOperationScope operation;
+        using (ExecutionContext.SuppressFlow())
+        {
+            operation = logger.BeginOperation("ImportOrders");
+        }
+
+        logger.Dispose();
+
+        Assert.Equal(Environment.CurrentManagedThreadId, flushThread);
+        operation.Dispose();
+    }
+
+    [Fact]
+    public void A_provider_that_disposes_the_logger_from_inside_the_entry_line_still_sees_started_before_still_running()
+    {
+        OperationLogger? logger = null;
+        using RecordingProvider disposing = new()
+        {
+            AfterLine = l =>
+            {
+                if (l.EventId == 9000)
+                {
+                    logger!.Dispose();
+                }
+            },
+        };
+        using RecordingProvider watching = new();
+        using ILoggerFactory factory = LoggerFactory.Create(builder => builder.AddProvider(disposing).AddProvider(watching));
+        logger = new(factory, new ThrottledLoggingOptions { EnableSweeper = false }, TimeProvider.System);
+
+        using IOperationScope operation = logger.BeginOperation("ImportOrders");
+
+        Assert.Equal([9000, 9008], [.. watching.Lines.Select(static l => l.EventId)]);
+    }
+
+    [Fact]
+    public void A_second_dispose_waits_for_the_first_to_finish_writing()
+    {
+        using ManualResetEventSlim writing = new(initialState: false);
+        using ManualResetEventSlim release = new(initialState: false);
+        using RecordingProvider provider = new()
+        {
+            AfterLine = l =>
+            {
+                if (l.EventId == 9008)
+                {
+                    writing.Set();
+                    release.Wait(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+                }
+            },
+        };
+        using ILoggerFactory factory = LoggerFactory.Create(builder => builder.AddProvider(provider));
+        OperationLogger logger = new(factory, new ThrottledLoggingOptions { EnableSweeper = false }, TimeProvider.System);
+        using IOperationScope operation = logger.BeginOperation("ImportOrders");
+
+        Thread first = new(logger.Dispose) { IsBackground = true };
+        first.Start();
+        Assert.True(writing.Wait(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken));
+        Thread second = new(logger.Dispose) { IsBackground = true };
+        second.Start();
+
+        Assert.False(second.Join(TimeSpan.FromMilliseconds(300)));
+        release.Set();
+        Assert.True(second.Join(TimeSpan.FromSeconds(10)));
+        Assert.True(first.Join(TimeSpan.FromSeconds(10)));
+    }
+
+    [Fact]
+    public void An_item_finished_after_its_operation_ended_writes_nothing()
+    {
+        using RecordingProvider provider = new();
+        using ILoggerFactory factory = LoggerFactory.Create(builder => builder.AddProvider(provider));
+        using OperationLogger logger = new(factory, new ThrottledLoggingOptions { EnableSweeper = false }, TimeProvider.System);
+        IOperationScope operation = logger.BeginOperation("ImportOrders");
+        IItemScope item = operation.BeginItem("order-1");
+
+        operation.Success();
+        item.Failure(new InvalidOperationException("too late"));   // would be the failure channel's first event
+        item.Dispose();
+
+        Assert.Equal(9001, provider.Lines[^1].EventId);
+    }
+
+    [Fact]
     public void Begin_after_dispose_is_refused()
     {
         using ILoggerFactory factory = LoggerFactory.Create(static _ => { });
@@ -675,22 +821,6 @@ public sealed class ContextTests
 
         Assert.Throws<ObjectDisposedException>(() => logger.BeginOperation("TooLate"));
     }
-
-    /// <summary>
-    /// Begins an operation on another thread whose context holds a large object in an AsyncLocal,
-    /// and returns the operation with a weak reference to that object. Nothing on the test's own
-    /// thread refers to the object, so only the operation's captured context can keep it alive.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    private static (IOperationScope Operation, WeakReference Captured) BeginInsideAContextHoldingABigObject(OperationLogger logger)
-        => Task.Run(() =>
-        {
-            byte[] big = new byte[1024 * 1024];
-            RequestState.Value = big;
-            return (logger.BeginOperation("ImportOrders"), new WeakReference(big));
-        }).GetAwaiter().GetResult();
-
-    private static readonly AsyncLocal<byte[]?> RequestState = new();
 
     /// <summary>
     /// Runs one sweep on a thread pool thread that inherits nothing from the test, the way the
