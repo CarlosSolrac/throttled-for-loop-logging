@@ -61,7 +61,7 @@ publish:
         wait-for-completion: true
         output-artifact-directory: artifacts-signed
         parameters: |
-          version: ${{ needs.plan.outputs.version }}
+          version: ${{ toJSON(needs.plan.outputs.version) }}   # each value must be a JSON string
 
     # The signed package must still be this package, this version, built from this commit.
     - name: Check the signed package

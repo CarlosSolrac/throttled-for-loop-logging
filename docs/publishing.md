@@ -116,7 +116,8 @@ waiting for CI. It does only the steps that are still missing:
 - a version not on NuGet.org yet is built from `main`, published, tagged and released;
 - a version already on NuGet.org without a GitHub release (the release step failed) gets its tag
   and release on the commit recorded inside the published package, with the package and symbols
-  downloaded from NuGet.org attached. It is never rebuilt from whatever `main` is now. The next
+  downloaded from NuGet.org attached. If NuGet.org is still validating the symbols, it waits up
+  to about fifteen minutes and otherwise fails, so the next run tries again. It is never rebuilt from whatever `main` is now. The next
   green CI run on `main` does this too, without asking.
 
 Only the version `main` currently carries is looked at. If a release step failed and `main` has

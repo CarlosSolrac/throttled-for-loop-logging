@@ -494,22 +494,23 @@ jobs:
           mkdir -p artifacts
           curl -sSfL -o "artifacts/${PACKAGE_ID}.${VERSION}.nupkg" \
             "https://api.nuget.org/v3-flatcontainer/${PACKAGE_ID_LOWER}/${version_lower}/${PACKAGE_ID_LOWER}.${version_lower}.nupkg"
-          # Symbols: retry anything but a clear answer, since a release created without them is
-          # never revisited. A 404 means no symbol package was ever published for this version.
+          # Symbols. Every release this workflow makes publishes them, but NuGet.org validates
+          # and indexes a symbol package after accepting it, answering 404 meanwhile, and a
+          # release created without them is never revisited. So wait for them, and fail
+          # rather than release without them; the next run tries again.
           symbols="artifacts/${PACKAGE_ID}.${VERSION}.snupkg"
-          for attempt in $(seq 1 10); do
-            status=$(curl -sSL -o "${symbols}" -w '%{http_code}' "https://www.nuget.org/api/v2/symbolpackage/${PACKAGE_ID}/${VERSION}" || echo 000)
-            case "${status}" in
-              200) break ;;
-              404) rm -f "${symbols}"; echo "::warning::NuGet.org has no symbol package for ${VERSION}; the release carries the .nupkg only."; break ;;
-              *)   rm -f "${symbols}"
-                   if [ "${attempt}" -eq 10 ]; then
-                     echo "::error::NuGet.org kept answering HTTP ${status} for the symbol package of ${VERSION}."
-                     exit 1
-                   fi
-                   echo "Symbol package request answered HTTP ${status} (attempt ${attempt}); retrying."
-                   sleep 30 ;;
-            esac
+          for attempt in $(seq 1 15); do
+            status=$(curl -sSL -o "${symbols}" -w '%{http_code}' "https://www.nuget.org/api/v2/symbolpackage/${PACKAGE_ID}/${VERSION}" || true)
+            if [ "${status}" = "200" ]; then
+              break
+            fi
+            rm -f "${symbols}"
+            if [ "${attempt}" -eq 15 ]; then
+              echo "::error::NuGet.org did not serve the symbol package for ${VERSION} (last answer HTTP ${status}). Run the Release workflow again later, or create the release by hand if this version has no symbols."
+              exit 1
+            fi
+            echo "Symbol package not served yet (HTTP ${status}, attempt ${attempt}); waiting."
+            sleep 60
           done
 
       # gh creates the tag on the given commit when it does not exist yet. A tag created with
