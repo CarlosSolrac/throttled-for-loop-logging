@@ -30,6 +30,26 @@ public sealed class ThrottleChannelTests
     }
 
     [Fact]
+    public void Sweeper_overtaken_by_a_submitter_does_not_repeat_the_event_the_submitter_just_wrote()
+    {
+        (ThrottleChannel channel, FakeTimeProvider time) = Build(everySeconds: 10);
+        channel.Submit("order-1", ItemOutcome.Started, null, time.GetUtcNow());      // first: written
+        channel.Submit("order-1", ItemOutcome.Succeeded, null, time.GetUtcNow());    // held
+        time.Advance(TimeSpan.FromSeconds(11));
+
+        // Between the sweeper's checks and its turn at the gate, the loop finishes another item and
+        // writes it itself on the time threshold, which resets the interval.
+        Emission? written = null;
+        channel.AfterSweeperCheck = () => written = channel.Submit("order-2", ItemOutcome.Succeeded, null, time.GetUtcNow());
+
+        Emission? swept = channel.TryFlushDueToTime();
+
+        Assert.NotNull(written);
+        Assert.Null(swept);
+        Assert.Equal(2, channel.Emitted);
+    }
+
+    [Fact]
     public void Second_event_is_held_and_not_logged()
     {
         (ThrottleChannel channel, FakeTimeProvider time) = Build();

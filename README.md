@@ -62,6 +62,26 @@ services.AddThrottledLogging(options =>
 });
 ```
 
+Or read the settings from configuration, such as `appsettings.json`:
+
+```csharp
+services.AddThrottledLogging(configuration.GetSection("ThrottledLogging"));
+```
+
+```json
+{
+  "ThrottledLogging": {
+    "EnableSweeper": true,
+    "Defaults": { "EveryItems": 500, "EveryInterval": "00:00:10", "FailureLevel": "Warning" }
+  }
+}
+```
+
+When that configuration reloads (`reloadOnChange: true`, a refreshed configuration provider),
+operations begun afterwards use the new settings, running ones keep theirs, and `EnableSweeper`
+starts or stops the sweeper. Settings that fail validation are logged as event 9011 and ignored,
+so the last good ones stay in force.
+
 And ask what is running, from anywhere, at any time:
 
 ```csharp
@@ -180,6 +200,24 @@ item order-7 Started — 0/1 done, 300 failed, new=False, ...,  0 held since las
 Both loops are equally stuck; only the second one looks it. Telling them apart needs the label
 carried alongside `IsNew`, which the library does not do yet — see "Still open" in the design
 document.
+
+## Context across hosts
+
+Everything the library tracks lives in memory, in one process. When a host restarts, recycles or
+scales out, the next run starts fresh. What carries over is the context the host knows about the
+run, and since 0.2.0 that context reaches every line the library writes:
+
+- a logging scope you open before `BeginOperation`, together with `Activity.Current`, is captured
+  and restored for the heartbeat lines the background sweeper writes;
+- `OperationOptions.Scope` attaches your own key/value pairs to one operation's lines;
+- every line carries `OperationId`;
+- disposing `OperationLogger` at shutdown writes out held events and a "still running" line
+  (event 9008) for each unfinished operation.
+
+[`docs/azure-functions-and-application-insights.md`](docs/azure-functions-and-application-insights.md)
+works through Storage queue, Service Bus, timer and Durable Functions triggers with Application
+Insights, plus a console job with no Azure at all, and gives the Kusto queries that stitch the runs
+back together.
 
 ## Getting started
 

@@ -52,15 +52,14 @@ public sealed class DependencyInjectionTests
     [Fact]
     public void Configured_defaults_apply_to_operations_that_supply_none()
     {
-        using ServiceProvider provider = Build(static options =>
+        List<ThrottledEvent> emitted = [];
+        using ServiceProvider provider = Build(options =>
         {
             options.EnableSweeper = false;
             options.Defaults.EveryItems = 3;
             options.Defaults.EveryInterval = TimeSpan.FromHours(1);
+            options.OnEmitted = emitted.Add;
         });
-
-        List<ThrottledEvent> emitted = [];
-        provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<ThrottledLoggingOptions>>().Value.OnEmitted = emitted.Add;
 
         IOperationLogger logger = provider.GetRequiredService<IOperationLogger>();
         using IOperationScope operation = logger.BeginOperation("ImportOrders");
@@ -73,6 +72,17 @@ public sealed class DependencyInjectionTests
 
         // Eighteen progress events at one line per three.
         Assert.Equal(6, emitted.Count);
+    }
+
+    [Fact]
+    public void A_null_configure_delegate_is_rejected_and_is_not_ambiguous()
+    {
+        ServiceCollection services = new();
+
+        // Not ambiguous with AddThrottledLogging(IConfiguration, Action? configure = null): C# prefers
+        // the overload that needs no default argument filled in. This stops compiling if that ever
+        // changes, which would break existing one-argument callers.
+        Assert.Throws<ArgumentNullException>(() => services.AddThrottledLogging(null!));
     }
 
     [Fact]

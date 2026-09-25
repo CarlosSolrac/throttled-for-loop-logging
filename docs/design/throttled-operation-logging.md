@@ -649,7 +649,10 @@ services.AddThrottledLogging(options =>
 });
 ```
 
-Bindable from `IConfiguration`. `ThrottledLoggingOptions` also carries an `OnEmitted` observer,
+Bindable from `IConfiguration` with `AddThrottledLogging(section)`, and reloaded when it changes:
+the logger follows `IOptionsMonitor`, validates each new version whole, and swaps it in for
+operations begun afterwards; running operations keep their own copy, and a version that fails
+validation is logged (9011) and ignored. `ThrottledLoggingOptions` also carries an `OnEmitted` observer,
 called with every event that survives throttling, for pushing the same data to metrics and for
 asserting on structure in tests rather than parsing log text.
 
@@ -756,3 +759,76 @@ Two further notes from building it:
 - **The ETA warm-up gate is elapsed-time as well as sample-count.** Five completed items is not
   enough on its own; `EtaMinimumElapsed` (one second by default) must also have passed, or a loop
   of very fast items would publish an estimate built from nothing.
+
+## 13. Context and host lifetime (0.2.0)
+
+Nothing about an operation outlives its process, and that is still by design: persistence would
+put I/O on the hot path. 0.2.0 instead makes sure that the context a host *does* keep reaches every
+line, so runs can be joined up afterwards. Worked examples for Azure Functions and Application
+Insights are in [`../azure-functions-and-application-insights.md`](../azure-functions-and-application-insights.md).
+
+| Gap in 0.1.0 | 0.2.0 |
+|---|---|
+| Heartbeat lines from the sweeper thread lost the caller's logging scopes and `Activity`, so they had no invocation id and no `operation_Id` | `OperationScope` captures the `ExecutionContext` at `BeginOperation` and runs sweeps and the shutdown flush inside it. A caller that suppressed flow captures nothing, and those lines behave as before |
+| No way to attach context to the library's lines without an outer scope | `OperationOptions.Scope`: key/value pairs copied at `BeginOperation` and opened as a scope around each line, as an immutable list of pairs, so structured sinks see fields and text sinks see `Key:Value, …` |
+| Item (9004), failure (9005) and failure-summary (9006) lines named the operation but not its id, so two concurrent runs of one function could not be told apart | Every line carries `{OperationId}`. This changes the message text of those lines; the structured fields only gain one |
+| Disposing `OperationLogger` stopped the sweeper and dropped whatever was held | `Dispose` flushes every running operation's held events and writes event **9008** ("still running when the logger shut down") with its counts. The operation stays open, because a function may still be draining |
+
+The scope is opened per line rather than once per operation because logging scopes live in the
+ambient context of whichever thread writes, and an operation's lines come from several threads.
+
+Two further changes came out of reviewing this work, and they apply whether or not a host is involved:
+
+- **The held event only moves forward.** Two submitters can take sequences 5 and 6 and publish in
+  the opposite order; a plain exchange then left 5 held and lost 6 entirely. `ThrottleChannel`
+  now publishes with a compare-and-swap that never replaces a later event with an earlier one.
+- **Only the sweeper may write an already-written event.** Two submitters that both saw the count
+  threshold could each pass the gate in turn and write the same event twice, the second time as
+  `IsNew=false`, and the second write was counted as an extra emission. The "already written"
+  check now happens under the gate for every reason except the sweeper's heartbeat, and a final
+  flush waits for the gate instead of giving up. `ConcurrencyTests` caught this intermittently
+  (about one run in eight on `main` before this change).
+
+Every path that decides an operation's last lines (`End`, a sweep, the shutdown flush) takes one
+lock per operation, so "still running" can never follow the operation's own end line, and a
+heartbeat never follows it either. The lock covers writing to the logging providers but not the
+`OnEmitted` observer: notifications made under it are collected and delivered once it is released,
+so an observer that waits for another thread to end the operation cannot deadlock (a second Codex
+pass raised this). A logging provider, which is called under the lock, must not block waiting for
+the same operation to end. `End` retires the operation and releases the captured context
+in a `finally`, so a throwing logging provider cannot strand it in the registry.
+
+Shutdown is bounded against a provider that hangs on another thread. `Dispose` first flushes every
+operation whose lock is free, then waits for the busy ones, sharing one five-second budget between
+them; an operation still locked after that is skipped and reported as event 9009. A provider that
+hangs on the disposing thread itself still hangs `Dispose`, since a synchronous call cannot be
+abandoned. `BeginOperation` checks for disposal and registers the operation under the same lock
+`Dispose` marks the logger disposed under, and holds the operation's lock until its entry line is
+written, so an operation begun during shutdown is either refused or flushed after its entry line.
+A sweep that throws is caught per operation and logged as event 9012, so the sweeper keeps running.
+
+The lock is reentrant, because a logging provider called under it may end the operation or dispose
+the logger. Observer notifications are therefore held until the outermost holder lets go, not
+just the inner one. A shutdown flush that re-enters from inside the entry line is postponed until
+that line has reached every provider. A second concurrent `Dispose` waits for the first to finish
+(bounded), except on the same thread. An operation that captured no context is flushed in the
+default context on the disposing thread, so shutdown never waits on the thread pool. Reloads run one
+at a time and each reads the monitor's current value, so racing change callbacks cannot restore
+older settings. The sweeper re-checks, under the channel gate, that its interval is still due, so
+it cannot repeat an event a submitter wrote a moment before. An item completed after its operation
+ended is ignored. A provider that disposes the logger from inside an entry line gets its shutdown
+flush after that line, and a second `Dispose` racing it on another thread waits for that flush too.
+A second `Dispose` that gives up waiting says so with event 9013.
+
+Known limits, accepted rather than paid for on the hot path or in shutdown time:
+
+- An item completing on another thread at the very instant the operation ends can slip past the
+  "already ended" check and write one line after the closing line, and its counts miss the logger's
+  totals. Closing that would put the lifecycle lock on every item completion; ending an operation
+  with items still running is a caller error in any case.
+- `OnEmitted` keeps write order within one thread's hold of the lock, including reentrant
+  providers. Across threads it can be called concurrently, as it always could from submitters.
+- A logging provider that hangs on the disposing thread itself hangs `Dispose`.
+- Options validation registered by the application runs inside the options monitor, before the
+  logger's reload handler. A reload that fails it throws from the reload and writes no 9011; the
+  logger keeps the last good settings.
