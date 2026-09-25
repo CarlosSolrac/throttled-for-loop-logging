@@ -40,14 +40,7 @@ on:
 # commit of main. Everything else (failed CI, pull requests, dry runs) gets a group of its own,
 # so it can never push a real release out of the queue.
 concurrency:
-  group: >-
-    ${{
-      ((github.event_name == 'workflow_run' &&
-        github.event.workflow_run.conclusion == 'success' &&
-        github.event.workflow_run.event == 'push') ||
-       (github.event_name == 'workflow_dispatch' && !inputs.dry-run && github.ref == 'refs/heads/main'))
-      && 'release' || format('release-inert-{0}', github.run_id)
-    }}
+  group: ${{ ((github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push') || (github.event_name == 'workflow_dispatch' && !inputs.dry-run && github.ref == 'refs/heads/main')) && 'release' || format('release-inert-{0}', github.run_id) }}
   cancel-in-progress: false
 
 permissions:
