@@ -68,8 +68,9 @@ Either way the credential lives in GitHub, never in the repository.
 
 The workflow's job runs in a GitHub environment named `nuget`. Add a required reviewer to it
 under Settings → Environments → `nuget` and every release pauses for your approval before
-anything reaches NuGet.org. Merges that do not change the version never reach that job, so they
-never ask. Leave it without protection rules and the publish proceeds
+anything reaches NuGet.org. Only a run that is about to push a version not yet on NuGet.org
+reaches that job, so ordinary merges never ask. The job that runs in the environment downloads
+the already-built package and pushes it; no code from the repository runs there. Leave it without protection rules and the publish proceeds
 unattended. Given that a published version can never be deleted, the approval is worth having.
 
 ## Releasing
@@ -82,26 +83,37 @@ That is all. When CI passes on the merge commit, the Release workflow starts on 
 
 - reads the version from the project, exactly as `dotnet pack` will stamp it;
 - asks NuGet.org and GitHub whether that version has already been released;
-- if not, builds, tests and packs that commit, waits for approval if the `nuget` environment
+- if not, builds, tests and packs the commit, waits for approval if the `nuget` environment
   requires one, and pushes the package;
 - then creates the tag `v<Version>` on that commit and a GitHub release with the `.nupkg` and
   `.snupkg` attached and generated notes. A version with a suffix, such as `0.3.0-beta`, is marked
   as a prerelease on GitHub, and NuGet.org treats it as one too.
 
-A merge that leaves the version alone releases nothing: the workflow sees the version is already
-out and stops with a notice. So does a failed CI run, which never reaches the release at all.
+What gets published is the newest commit on `main` whose CI passed, not necessarily the commit
+that changed the version. If two pull requests merge close together, the release is built from
+the later one, once; the run for the earlier one sees that `main` has moved on and stands aside.
+If you bump the version twice before either is released, only the second version is published.
 
-`Directory.Build.props` is the only place the version lives. The tag is written by the workflow
-from it, so the two cannot disagree. Do not push `v*` tags yourself. They do not trigger
-anything, and a tag that already exists on a different commit stops the release with an error
-rather than publish code that does not match it.
+A merge that leaves the version alone releases nothing: the workflow sees the version is already
+out and stops with a notice. So does a failed CI run, which never reaches the release at all;
+the next green run on `main` picks the unreleased version up.
+
+`Directory.Build.props` is the only place the version lives. The workflow writes the tag from
+it, and every package records the commit it was built from, so the tag always goes on the commit
+NuGet.org's package came from. Do not push `v*` tags yourself. They do not trigger anything, and
+a tag that already exists on a different commit stops the release with an error rather than
+publish code that does not match it.
 
 ### Releasing by hand
 
 Actions → Release → Run workflow, on `main`, releases whatever version `main` carries without
-waiting for CI. Use it to retry after fixing credentials, or to finish a release that reached
-NuGet.org but failed before creating its tag and GitHub release: the workflow only does the steps
-that are still missing, and a package that is already on NuGet.org is not pushed again.
+waiting for CI. It does only the steps that are still missing:
+
+- a version not on NuGet.org yet is built from `main`, published, tagged and released;
+- a version already on NuGet.org without a GitHub release (the release step failed) gets its tag
+  and release on the commit recorded inside the published package, with the package downloaded
+  from NuGet.org attached. It is never rebuilt from whatever `main` is now. The next green CI run
+  on `main` does this too, without asking.
 
 ### When something fails
 
@@ -109,11 +121,15 @@ that are still missing, and a package that is already on NuGet.org is not pushed
   still on `main`, so the next green run releases it.
 - **The push to NuGet.org failed.** Usually missing or expired credentials (see step 3 above).
   Fix them, then re-run the failed jobs of that Release run, or run the workflow by hand.
-- **The package is on NuGet.org but the tag or GitHub release is missing.** Re-run the failed job,
-  or run the workflow by hand. Later merges only warn about it; they do not retry it for you.
-- **"Tag vX already exists on another commit."** The version was already released from other
-  code. Bump `<Version>` again, or delete the tag if it was pushed by mistake and nothing was
-  published under it.
+- **NuGet.org says the version already exists.** The workflow downloads the package that is
+  there. If it was built from the same commit (a re-run after a push that went through), the
+  release carries on. If not, it stops: change `<Version>` and merge again.
+- **The package is on NuGet.org but the tag or GitHub release is missing.** The next green CI run
+  on `main` finishes it, or run the workflow by hand.
+- **"Tag vX already exists on another commit."** A tag with this version exists but nothing was
+  published under it. Delete the tag if it was pushed by mistake, or change `<Version>`.
+- **A draft GitHub release for the tag exists.** Publish or delete the draft, then run the
+  workflow by hand.
 
 ## Rehearsing
 

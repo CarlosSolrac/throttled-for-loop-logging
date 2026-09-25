@@ -17,41 +17,60 @@ once the free subscription is granted.
 
 ## What the release workflow needs to add
 
-Signing happens in the release workflow's `publish` job, after the package is packed and before it
-is pushed to NuGet, so that what is published is the signed package. The `github-release` job
-attaches whatever `publish` uploaded, so upload the signed package under the name it downloads.
+Signing happens in the release workflow's `publish` job, after it downloads the package that the
+`build` job packed and before it pushes to NuGet, so that what is published is the signed package.
+The SignPath action needs the id of an uploaded artifact, so upload the build job's package with an
+`id` on that step and pass its `artifact-id` output on. The `github-release` job attaches the
+artifact named `nupkg-<version>`, so after signing, upload the signed package under that name with
+`overwrite: true`; otherwise the GitHub release would carry the unsigned one.
 
 ```yaml
-permissions:
-  contents: read
-  actions: read          # needed while the repository is private and the SignPath GitHub App is not installed
-  id-token: write        # only if NuGet trusted publishing is used in the same job
+build:
+  steps:
+    # ... checkout, setup-dotnet, restore, build, test, pack into artifacts/, check the package ...
 
-steps:
-  # ... checkout, setup-dotnet, restore, build, test, pack into artifacts/ ...
+    - name: Upload package
+      id: upload-unsigned          # add an id so the publish job can name this artifact
+      uses: actions/upload-artifact@v6
+      with:
+        name: nupkg-${{ needs.plan.outputs.version }}
+        path: |
+          artifacts/*.nupkg
+          artifacts/*.snupkg
+        if-no-files-found: error
+  outputs:
+    unsigned-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
 
-  - name: Upload unsigned package
-    id: upload-unsigned
-    uses: actions/upload-artifact@v4
-    with:
-      name: nupkg-unsigned
-      path: artifacts/*.nupkg
-      if-no-files-found: error
+publish:
+  permissions:
+    actions: read          # lets SignPath fetch the artifact
+    id-token: write        # NuGet trusted publishing, as today
+  timeout-minutes: 120     # waits for a human to approve the signing request
+  steps:
+    - name: Submit signing request
+      uses: signpath/github-action-submit-signing-request@v2
+      with:
+        api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+        organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+        project-slug: throttled-for-loop-logging
+        signing-policy-slug: release-signing
+        artifact-configuration-slug: nupkg
+        github-artifact-id: ${{ needs.build.outputs.unsigned-artifact-id }}
+        wait-for-completion: true
+        output-artifact-directory: artifacts
 
-  - name: Submit signing request
-    uses: signpath/github-action-submit-signing-request@v2
-    with:
-      api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
-      organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
-      project-slug: throttled-for-loop-logging
-      signing-policy-slug: release-signing
-      artifact-configuration-slug: nupkg
-      github-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
-      wait-for-completion: true
-      output-artifact-directory: artifacts-signed
+    # Replace the unsigned artifact, so the GitHub release attaches what NuGet.org gets.
+    - name: Upload signed package
+      uses: actions/upload-artifact@v6
+      with:
+        name: nupkg-${{ needs.plan.outputs.version }}
+        path: |
+          artifacts/*.nupkg
+          artifacts/*.snupkg
+        overwrite: true
+        if-no-files-found: error
 
-  - name: Push signed package
-    run: dotnet nuget push 'artifacts-signed/*.nupkg' --source https://api.nuget.org/v3/index.json --api-key "$NUGET_API_KEY"
+    # ... then the existing NuGet login and Push steps, unchanged ...
 ```
 
 Notes that matter:
@@ -61,7 +80,7 @@ Notes that matter:
 - For an open source subscription every job in the workflow must run on GitHub-hosted runners.
 - `wait-for-completion: true` blocks until an approver has approved the request in SignPath, which is
   how the "every release needs manual approval" condition is met. Give the job a generous timeout.
-- The release job already runs in a GitHub environment that can require a reviewer; that gate and the
+- The `publish` job already runs in a GitHub environment that can require a reviewer; that gate and the
   SignPath approval are independent, and both are worth keeping.
 - These steps are written here rather than committed into
   [`.github/workflows/release.yml`](../.github/workflows/release.yml), because the SignPath
