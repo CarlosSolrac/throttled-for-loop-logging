@@ -17,8 +17,9 @@ once the free subscription is granted.
 
 ## What the release workflow needs to add
 
-Signing happens in the release workflow, after the package is packed and before it is pushed to
-NuGet, so that what is published is the signed package.
+Signing happens in the release workflow's `publish` job, after the package is packed and before it
+is pushed to NuGet, so that what is published is the signed package. The `github-release` job
+attaches whatever `publish` uploaded, so upload the signed package under the name it downloads.
 
 ```yaml
 permissions:
@@ -65,7 +66,7 @@ Notes that matter:
 - These steps are written here rather than committed into
   [`.github/workflows/release.yml`](../.github/workflows/release.yml), because the SignPath
   organization id, project slug and API token they need do not exist until the subscription does,
-  and a workflow referencing them would fail on the first tag push.
+  and a workflow referencing them would fail on the next release.
 
 ## Artifact configuration
 

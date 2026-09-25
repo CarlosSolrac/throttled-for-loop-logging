@@ -28,7 +28,7 @@
     from a debugger without a separate SourceLink package reference.
   -->
   <PropertyGroup>
-    <Version>0.2.0-alpha</Version>
+    <Version>0.2.0</Version>
     <Authors>CarlosK</Authors>
     <Copyright>Copyright (c) 2026 CarlosK</Copyright>
     <PackageTags>logging;ilogger;throttling;progress;eta;diagnostics</PackageTags>

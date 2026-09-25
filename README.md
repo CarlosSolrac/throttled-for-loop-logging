@@ -257,9 +257,10 @@ behind the ETA. Section 12 lists where the built library differs from the design
 
 Published as [**ThrottledForLoopLogging**](https://www.nuget.org/packages/ThrottledForLoopLogging)
 — the package ID differs from the assembly name because `ThrottledLogging` was already taken by
-an unrelated package. Releases go to NuGet.org on a tag push, via
-[`.github/workflows/release.yml`](.github/workflows/release.yml); the one-time account and
-credential setup is in [`docs/publishing.md`](docs/publishing.md).
+an unrelated package. Releasing is automatic: merging a change to `<Version>` in
+`Directory.Build.props` into `main` publishes that version to NuGet.org and creates its tag and
+GitHub release, via [`.github/workflows/release.yml`](.github/workflows/release.yml). The one-time
+account and credential setup is in [`docs/publishing.md`](docs/publishing.md).
 
 ## Code signing
 
