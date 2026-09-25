@@ -80,7 +80,7 @@ examples were compiled against these packages:
 | `Microsoft.Azure.Functions.Worker.Extensions.ServiceBus` | 5.24.0 |
 | `Microsoft.Azure.Functions.Worker.Extensions.Timer` | 4.3.1 |
 | `Microsoft.Azure.Functions.Worker.Extensions.DurableTask` | 1.19.1 |
-| `ThrottledForLoopLogging` | 0.2.0-alpha |
+| `ThrottledForLoopLogging` | 0.2.0 |
 
 `Microsoft.ApplicationInsights.WorkerService` stays on 2.x on purpose. The worker's Application
 Insights package depends on the 2.x SDK, and 3.x is a different, OpenTelemetry-based SDK. If you

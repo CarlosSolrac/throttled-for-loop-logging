@@ -1,8 +1,10 @@
 # Publishing to NuGet.org
 
-Releasing is a tag push. `.github/workflows/release.yml` builds, tests, packs and pushes
-the package and its symbols; everything else on this page is the one-time setup around it,
-and all of it needs a human — nothing here can be automated from the repository alone.
+Releasing is a version bump. Change `<Version>` in `Directory.Build.props`, merge it to `main`,
+and `.github/workflows/release.yml` does the rest once CI is green on that commit: it builds,
+tests and packs, pushes the package and its symbols to NuGet.org, creates the tag `v<Version>`
+on that commit, and creates a GitHub release with the packages attached. Nobody pushes a tag by
+hand. Everything else on this page is the one-time setup around it, which needs a human.
 
 ## Before the first release
 
@@ -65,32 +67,90 @@ Either way the credential lives in GitHub, never in the repository.
 ### 4. Decide whether a release needs approval
 
 The workflow's job runs in a GitHub environment named `nuget`. Add a required reviewer to it
-under Settings → Environments → `nuget` and every tag push pauses for your approval before
-anything reaches NuGet.org. Leave it without protection rules and the publish proceeds
+under Settings → Environments → `nuget` and every release pauses for your approval before
+anything reaches NuGet.org. Only a run that is about to push a version not yet on NuGet.org
+reaches that job, so ordinary merges never ask. The job that runs in the environment downloads
+the already-built package and pushes it; no code from the repository runs there. Leave it without protection rules and the publish proceeds
 unattended. Given that a published version can never be deleted, the approval is worth having.
 
 ## Releasing
 
-1. Bump `<Version>` in `Directory.Build.props` and merge that to `main`.
-2. Tag the merge commit and push the tag:
+1. Change `<Version>` in `Directory.Build.props` to the new version, in the same pull request as
+   the changes it ships or in one of its own.
+2. Merge it to `main`.
 
-```bash
-git tag v0.2.0
-git push origin v0.2.0
-```
+That is all. When CI passes on the merge commit, the Release workflow starts on its own and:
 
-The tag must match `<Version>` exactly, with a leading `v`. The workflow compares the two and
-refuses to publish if they disagree, which is what catches a tag without a bump and a bump
-without a matching tag. `Directory.Build.props` is the source of truth; the tag only confirms it.
+- reads the version from the project, exactly as `dotnet pack` will stamp it;
+- asks NuGet.org and GitHub whether that version has already been released;
+- if not, builds, tests and packs the commit, waits for approval if the `nuget` environment
+  requires one, and pushes the package;
+- then creates the tag `v<Version>` on that commit and a GitHub release with the `.nupkg` and
+  `.snupkg` attached and generated notes. A version with a suffix, such as `0.3.0-beta`, is marked
+  as a prerelease on GitHub, and NuGet.org treats it as one too.
 
-A prerelease version (`0.1.0-alpha`) is published as a prerelease automatically — NuGet reads
-the suffix, there is no separate flag.
+What gets published is the newest commit on `main` whose CI passed, not necessarily the commit
+that changed the version. If two pull requests merge close together, the release is built from
+the later one, once. A run for an older commit either releases the newest commit instead (when
+that commit's CI has already passed) or stands aside for that commit's own run, and just before
+pushing, the workflow checks `main` again and stands aside if it moved while building or
+waiting for approval. If the newest commit's CI fails, nothing is released until a later commit
+on `main` passes. If you bump the version twice before either is released, only the second
+version is published.
+
+A merge that leaves the version alone releases nothing: the workflow sees the version is already
+out and stops with a notice. So does a failed CI run, which never reaches the release at all;
+the next green run on `main` picks the unreleased version up.
+
+`Directory.Build.props` is the only place the version lives. The workflow writes the tag from
+it, and every package records the commit it was built from, so the tag always goes on the commit
+NuGet.org's package came from. Do not push `v*` tags yourself. They do not trigger anything, and
+a tag that already exists on a different commit stops the release with an error rather than
+publish code that does not match it.
+
+### Releasing by hand
+
+Actions → Release → Run workflow, on `main`, releases whatever version `main` carries without
+waiting for CI. It does only the steps that are still missing:
+
+- a version not on NuGet.org yet is built from `main`, published, tagged and released;
+- a version already on NuGet.org without a GitHub release (the release step failed) gets its tag
+  and release on the commit recorded inside the published package, with the package and symbols
+  downloaded from NuGet.org attached. If NuGet.org is still validating the symbols, it waits up
+  to about fifteen minutes and otherwise fails, so the next run tries again. It is never rebuilt from whatever `main` is now. The next
+  green CI run on `main` does this too, without asking.
+
+Only the version `main` currently carries is looked at. If a release step failed and `main` has
+since moved to a newer version, create the older tag and release by hand: the commit is in the
+`<repository commit="…">` element of the package's `.nuspec` on NuGet.org.
+
+### When something fails
+
+- **CI failed on the merge.** Nothing was released. Fix it and merge again; the version bump is
+  still on `main`, so the next green run releases it.
+- **The push to NuGet.org failed.** Usually missing or expired credentials (see step 3 above).
+  Fix them, then re-run the failed jobs of that Release run, or run the workflow by hand.
+- **NuGet.org says the version already exists.** The workflow downloads the package that is
+  there. If it was built from the same commit (a re-run after a push that went through), the
+  release carries on and attaches the package NuGet.org serves. If not, it stops: change
+  `<Version>` and merge again.
+- **The package is on NuGet.org but the tag or GitHub release is missing.** The next green CI run
+  on `main` finishes it, or run the workflow by hand.
+- **"Tag vX already exists on another commit."** A tag with this version exists but nothing was
+  published under it. Delete the tag if it was pushed by mistake, or change `<Version>`.
+- **A draft GitHub release for the tag exists.** Usually a release step that died halfway, since
+  `gh release create` makes a draft, uploads, then publishes. Delete the draft, then run the
+  workflow by hand.
+- **"Tag vX is on one commit, but the package was built from another."** The tag was moved or
+  made by hand. Move it to the commit named in the error.
 
 ## Rehearsing
 
-Run the workflow manually (Actions → Release → Run workflow). It does everything except the
-push and leaves the `.nupkg` and `.snupkg` as a build artifact you can download and inspect —
-`unzip -l` it, or open it in [NuGet Package Explorer](https://github.com/NuGetPackageExplorer/NuGetPackageExplorer).
+Run the workflow by hand with **dry run** ticked. It builds, tests and packs, and leaves the
+`.nupkg` and `.snupkg` as a build artifact you can download and inspect (`unzip -l` it, or open it
+in [NuGet Package Explorer](https://github.com/NuGetPackageExplorer/NuGetPackageExplorer)). It
+publishes nothing and creates no tag or release. A run started from any branch other than `main`
+is always a dry run.
 
 Locally, `dotnet pack src/ThrottledLogging/ThrottledLogging.csproj -c Release -o artifacts`
 produces the same two files.
@@ -103,8 +163,8 @@ it, and **that version number can never be reused**. Deletion happens only for l
 security reasons, by asking NuGet support.
 
 So the first push of a new package ID is the decision that sticks: after it, the ID and every
-version number you burn are permanent. Rehearse with a manual run, and consider starting on a
-prerelease version.
+version number you burn are permanent. Rehearse with a dry run, and remember that merging a
+version bump to `main` is what publishes.
 
 ## What the package already carries
 
