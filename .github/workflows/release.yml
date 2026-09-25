@@ -34,10 +34,20 @@ on:
         default: false
 
 # One release at a time, and never cancel one halfway through a publish. GitHub keeps only the
-# newest pending run in the group; that is safe because only the newest commit on main is ever
-# published, so a superseded pending run had nothing left to do.
+# newest pending run in a group. Only runs that can release join the shared group: a green CI
+# run on main, or a manual run on main that is not a dry run. A superseded pending one had
+# nothing left to do, because whichever eligible run comes next plans for the newest green
+# commit of main. Everything else (failed CI, pull requests, dry runs) gets a group of its own,
+# so it can never push a real release out of the queue.
 concurrency:
-  group: release
+  group: >-
+    ${{
+      ((github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push') ||
+       (github.event_name == 'workflow_dispatch' && !inputs.dry-run && github.ref == 'refs/heads/main'))
+      && 'release' || format('release-inert-{0}', github.run_id)
+    }}
   cancel-in-progress: false
 
 permissions:
@@ -359,30 +369,7 @@ jobs:
       served-by-nuget: ${{ steps.push.outputs.served-by-nuget }}
 
     steps:
-      # The build and a possible approval wait take time, and main may have moved on meanwhile.
-      # Publishing is irreversible, so check again right before it: if main has a newer commit,
-      # this run stands aside and that commit's release run, queued behind this one, releases.
-      - name: Confirm this is still the newest commit on main
-        id: still-newest
-        env:
-          SHA: ${{ needs.plan.outputs.sha }}
-          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
-        run: |
-          set -euo pipefail
-          main_sha=$(git ls-remote "${REPO_URL}" refs/heads/main | cut -f1)
-          if [ -z "${main_sha}" ]; then
-            echo "::error::Could not read the tip of main."
-            exit 1
-          fi
-          if [ "${main_sha}" = "${SHA}" ]; then
-            echo "proceed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice::main moved on to ${main_sha} while this run was building or waiting; not publishing ${SHA}. The release run for the newer commit publishes instead."
-            echo "proceed=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Download package
-        if: steps.still-newest.outputs.proceed == 'true'
         uses: actions/download-artifact@v6
         with:
           name: nupkg-${{ needs.plan.outputs.version }}
@@ -394,19 +381,19 @@ jobs:
       # NUGET_API_KEY secret.
       - name: Request a short-lived NuGet API key
         id: nuget-login
-        if: steps.still-newest.outputs.proceed == 'true' && vars.NUGET_USER != ''
+        if: vars.NUGET_USER != ''
         uses: NuGet/login@v1
         with:
           user: ${{ vars.NUGET_USER }}
 
       - name: Push
         id: push
-        if: steps.still-newest.outputs.proceed == 'true'
         env:
           # The short-lived key when trusted publishing is configured, the stored secret otherwise.
           NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY || secrets.NUGET_API_KEY }}
           VERSION: ${{ needs.plan.outputs.version }}
           SHA: ${{ needs.plan.outputs.sha }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
         run: |
           set -euo pipefail
           if [ -z "${NUGET_API_KEY}" ]; then
@@ -414,40 +401,70 @@ jobs:
             exit 1
           fi
           package="artifacts/${PACKAGE_ID}.${VERSION}.nupkg"
-          # A matching .snupkg beside the .nupkg is pushed with it automatically.
-          if dotnet nuget push "${package}" --api-key "${NUGET_API_KEY}" --source https://api.nuget.org/v3/index.json 2>&1 | tee push.log; then
-            echo "pushed=true" >> "$GITHUB_OUTPUT"
+          symbols="artifacts/${PACKAGE_ID}.${VERSION}.snupkg"
+          source=https://api.nuget.org/v3/index.json
+
+          # The build and a possible approval wait take time, and main may have moved on.
+          # Publishing is irreversible, so check once more immediately before it: if main has
+          # a newer commit, stand aside; that commit's release run, queued behind this one,
+          # publishes instead.
+          main_sha=$(git ls-remote "${REPO_URL}" refs/heads/main | cut -f1)
+          if [ -z "${main_sha}" ]; then
+            echo "::error::Could not read the tip of main."
+            exit 1
+          fi
+          if [ "${main_sha}" != "${SHA}" ]; then
+            echo "::notice::main moved on to ${main_sha} while this run was building or waiting; not publishing ${SHA}. The release run for the newer commit publishes instead."
             exit 0
           fi
-          if ! grep -q 'does not indicate success: 409' push.log; then
+
+          # The package first, on its own, so its outcome is not mixed up with the symbols'.
+          if dotnet nuget push "${package}" --no-symbols --api-key "${NUGET_API_KEY}" --source "${source}" 2>&1 | tee push.log; then
+            :
+          elif grep -q 'does not indicate success: 409' push.log; then
+            # 409: the version is already there. That is fine only if it came from this very
+            # commit, say a re-run after a push that went through but reported a failure.
+            # Anything else is another package under this version number, and releasing over
+            # it would tag code that does not match what NuGet.org serves.
+            version_lower="${VERSION,,}"
+            url="https://api.nuget.org/v3-flatcontainer/${PACKAGE_ID_LOWER}/${version_lower}/${PACKAGE_ID_LOWER}.${version_lower}.nupkg"
+            commit=""
+            for attempt in $(seq 1 20); do
+              if curl -sSfL -o published.nupkg "${url}"; then
+                commit=$(unzip -p published.nupkg '*.nuspec' | sed -n 's:.*<repository [^>]*commit="\([0-9a-f]\{40\}\)".*:\1:p' | head -1)
+                break
+              fi
+              echo "NuGet.org reports ${VERSION} exists but does not serve it yet (attempt ${attempt}); waiting."
+              sleep 30
+            done
+            if [ -z "${commit}" ]; then
+              echo "::error::NuGet.org rejected ${VERSION} as a duplicate, but its origin could not be read."
+              exit 1
+            fi
+            if [ "${commit}" != "${SHA}" ]; then
+              echo "::error::${PACKAGE_ID} ${VERSION} is already on NuGet.org, built from ${commit}, not ${SHA}. Change <Version> and release again."
+              exit 1
+            fi
+            # The GitHub release then attaches the package NuGet.org serves, not this run's
+            # rebuild of it, which need not be byte-for-byte the same.
+            echo "::notice::${PACKAGE_ID} ${VERSION} was already on NuGet.org, built from this same commit; continuing."
+            echo "served-by-nuget=true" >> "$GITHUB_OUTPUT"
+          else
             exit 1
           fi
 
-          # 409: the version is already there. That is fine only if it came from this very
-          # commit, say a re-run after a push that went through but reported a failure.
-          # Anything else is another package under this version number, and releasing over it
-          # would tag code that does not match what NuGet.org serves.
-          version_lower="${VERSION,,}"
-          url="https://api.nuget.org/v3-flatcontainer/${PACKAGE_ID_LOWER}/${version_lower}/${PACKAGE_ID_LOWER}.${version_lower}.nupkg"
-          for attempt in $(seq 1 20); do
-            if curl -sSfL -o published.nupkg "${url}"; then
-              commit=$(unzip -p published.nupkg '*.nuspec' | sed -n 's:.*<repository [^>]*commit="\([0-9a-f]\{40\}\)".*:\1:p' | head -1)
-              if [ "${commit}" = "${SHA}" ]; then
-                # The GitHub release then attaches the package NuGet.org serves, not this
-                # run's rebuild of it, which need not be byte-for-byte the same.
-                echo "::notice::${PACKAGE_ID} ${VERSION} was already on NuGet.org, built from this same commit; continuing."
-                echo "pushed=true" >> "$GITHUB_OUTPUT"
-                echo "served-by-nuget=true" >> "$GITHUB_OUTPUT"
-                exit 0
+          # Then the symbols. A 409 means they are already there; any other failure fails the
+          # job before the release is created, and a re-run picks up from here.
+          if [ -f "${symbols}" ]; then
+            if ! dotnet nuget push "${symbols}" --api-key "${NUGET_API_KEY}" --source "${source}" 2>&1 | tee push-symbols.log; then
+              if grep -q 'does not indicate success: 409' push-symbols.log; then
+                echo "::notice::The symbol package for ${VERSION} was already on NuGet.org."
+              else
+                exit 1
               fi
-              echo "::error::${PACKAGE_ID} ${VERSION} is already on NuGet.org, built from '${commit}', not ${SHA}. Change <Version> and release again."
-              exit 1
             fi
-            echo "NuGet.org reports ${VERSION} exists but does not serve it yet (attempt ${attempt}); waiting."
-            sleep 30
-          done
-          echo "::error::NuGet.org rejected ${VERSION} as a duplicate but never served it, so its origin cannot be checked."
-          exit 1
+          fi
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
 
   # Tags the released commit and creates the GitHub release. It is a separate job so that the
   # write token never shares a runner with the build and test code above.
@@ -484,11 +501,23 @@ jobs:
           mkdir -p artifacts
           curl -sSfL -o "artifacts/${PACKAGE_ID}.${VERSION}.nupkg" \
             "https://api.nuget.org/v3-flatcontainer/${PACKAGE_ID_LOWER}/${version_lower}/${PACKAGE_ID_LOWER}.${version_lower}.nupkg"
-          if ! curl -sSfL -o "artifacts/${PACKAGE_ID}.${VERSION}.snupkg" \
-            "https://www.nuget.org/api/v2/symbolpackage/${PACKAGE_ID}/${VERSION}"; then
-            rm -f "artifacts/${PACKAGE_ID}.${VERSION}.snupkg"
-            echo "::warning::NuGet.org did not serve the symbol package for ${VERSION}; the release carries the .nupkg only."
-          fi
+          # Symbols: retry anything but a clear answer, since a release created without them is
+          # never revisited. A 404 means no symbol package was ever published for this version.
+          symbols="artifacts/${PACKAGE_ID}.${VERSION}.snupkg"
+          for attempt in $(seq 1 10); do
+            status=$(curl -sSL -o "${symbols}" -w '%{http_code}' "https://www.nuget.org/api/v2/symbolpackage/${PACKAGE_ID}/${VERSION}" || echo 000)
+            case "${status}" in
+              200) break ;;
+              404) rm -f "${symbols}"; echo "::warning::NuGet.org has no symbol package for ${VERSION}; the release carries the .nupkg only."; break ;;
+              *)   rm -f "${symbols}"
+                   if [ "${attempt}" -eq 10 ]; then
+                     echo "::error::NuGet.org kept answering HTTP ${status} for the symbol package of ${VERSION}."
+                     exit 1
+                   fi
+                   echo "Symbol package request answered HTTP ${status} (attempt ${attempt}); retrying."
+                   sleep 30 ;;
+            esac
+          done
 
       # gh creates the tag on the given commit when it does not exist yet. A tag created with
       # the workflow's own token does not start other workflows, so this cannot loop.

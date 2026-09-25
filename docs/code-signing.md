@@ -60,15 +60,23 @@ publish:
         github-artifact-id: ${{ needs.build.outputs.unsigned-artifact-id }}
         wait-for-completion: true
         output-artifact-directory: artifacts-signed
+        parameters: |
+          version: ${{ needs.plan.outputs.version }}
 
-    # The signed package must still be this version, built from this commit.
+    # The signed package must still be this package, this version, built from this commit.
     - name: Check the signed package
+      env:
+        VERSION: ${{ needs.plan.outputs.version }}
+        SHA: ${{ needs.plan.outputs.sha }}
       run: |
         set -euo pipefail
         package="artifacts-signed/${PACKAGE_ID}.${VERSION}.nupkg"
         test -f "${package}"
         unzip -l "${package}" | grep -q '\.signature\.p7s$'
-        unzip -p "${package}" '*.nuspec' | grep -q "commit=\"${SHA}\""
+        nuspec=$(unzip -p "${package}" '*.nuspec')
+        echo "${nuspec}" | grep -q "<id>${PACKAGE_ID}</id>"
+        echo "${nuspec}" | grep -q "<version>${VERSION}</version>"
+        echo "${nuspec}" | grep -q "commit=\"${SHA}\""
 
     - name: Replace the artifact with the signed package
       uses: actions/upload-artifact@v6
@@ -80,8 +88,8 @@ publish:
         overwrite: true
         if-no-files-found: error
 
-    # ... then the existing NuGet login and Push steps, with the package path changed to
-    # artifacts-signed/ and the .snupkg copied next to it so it is pushed alongside ...
+    # ... then the existing NuGet login and Push steps, reading the .nupkg from
+    # artifacts-signed/ (the .snupkg is unchanged and stays in artifacts/) ...
 ```
 
 Notes that matter:
@@ -108,17 +116,20 @@ conditions require, and leaves the symbol package as it is:
 
 ```xml
 <artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <parameters>
+    <parameter name="version" required="true" />
+  </parameters>
   <zip-file>
     <nupkg-file path="ThrottledForLoopLogging.*.nupkg">
       <nuget-sign />
       <directory path="lib">
         <directory path="net8.0">
-          <pe-file path="ThrottledLogging.dll" product-name="ThrottledForLoopLogging" product-version="0.2.0">
+          <pe-file path="ThrottledLogging.dll" product-name="ThrottledForLoopLogging" product-version="${version}">
             <authenticode-sign />
           </pe-file>
         </directory>
         <directory path="net10.0">
-          <pe-file path="ThrottledLogging.dll" product-name="ThrottledForLoopLogging" product-version="0.2.0">
+          <pe-file path="ThrottledLogging.dll" product-name="ThrottledForLoopLogging" product-version="${version}">
             <authenticode-sign />
           </pe-file>
         </directory>
@@ -128,11 +139,12 @@ conditions require, and leaves the symbol package as it is:
 </artifact-configuration>
 ```
 
-`product-version` must equal `<Version>` in `Directory.Build.props` for the release being signed.
+`product-version` is filled from the `version` parameter that the signing request above passes,
+which comes from `<Version>` in `Directory.Build.props`, so a version bump needs no change in
+SignPath.
 Check the element names against the
 [artifact configuration reference](https://docs.signpath.io/artifact-configuration/reference) when you
-paste it in, and parameterise the version rather than hard-coding it if you would rather not edit the
-configuration on every release.
+paste it in, including how parameters are declared and passed.
 
 ## Steps that happen outside this repository
 
