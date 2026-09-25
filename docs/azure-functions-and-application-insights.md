@@ -204,8 +204,8 @@ mounted Kubernetes ConfigMap):
   settings they began with, so a loop's thresholds never shift halfway through it.
 - **`EnableSweeper`** starts or stops the sweeper. **Sweep intervals** take effect from the
   sweeper's next tick.
-- **Invalid settings** (say `EveryItems: 0`, or a maximum sweep interval below the minimum) are
-  rejected as a whole: the library logs event 9011 at `Warning` with the reason, and the last good
+- **Invalid settings** (say `EveryItems: 0`, `EveryItems: "abc"`, or a maximum sweep interval
+  below the minimum) are rejected as a whole: the library logs event 9011 at `Warning` with the reason, and the last good
   settings stay in force. Settings invalid at startup still throw, when `OperationLogger` is first
   resolved.
 
@@ -1168,8 +1168,9 @@ for long runs.
   the container is built, no longer reaches the logger. Set everything, `OnEmitted` included, in
   the configure delegate or in configuration. `AddThrottledLogging` now builds the logger from
   `IOptionsMonitor`, so a registered configuration change does reach it, as described above.
-- **Sweep intervals are validated:** `MinimumSweepInterval` must be greater than zero and
-  `MaximumSweepInterval` at least as large. Invalid values throw when the logger is built; before,
-  they were accepted, and a zero maximum silently stopped the sweeper.
+- **Sweep intervals are validated:** `MinimumSweepInterval` must be at least one millisecond,
+  and `MaximumSweepInterval` at least as large and no more than about 49.7 days, the range the
+  sweeper's timer accepts. Invalid values throw when the logger is built; before, they were
+  accepted, and a value outside that range silently stopped the sweeper.
 - **Behaviour at shutdown:** disposing `OperationLogger` now writes lines where it used to write
   none.

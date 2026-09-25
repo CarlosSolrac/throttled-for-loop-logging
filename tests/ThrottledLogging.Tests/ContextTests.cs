@@ -457,6 +457,34 @@ public sealed class ContextTests
     }
 
     [Fact]
+    public void A_provider_that_ends_the_operation_during_the_shutdown_flush_gets_no_still_running_line_after_the_end()
+    {
+        using RecordingProvider provider = new();
+        using ILoggerFactory factory = LoggerFactory.Create(builder => builder.AddProvider(provider));
+        OperationLogger logger = new(factory, new ThrottledLoggingOptions { EnableSweeper = false }, TimeProvider.System);
+        IOperationScope operation = logger.BeginOperation("ImportOrders");
+        using (IItemScope item = operation.BeginItem("order-1"))   // Started: the first event, written
+        {
+            item.Success();                                         // Succeeded: held
+        }
+
+        // The provider re-enters the library on the thread writing the held line, which already
+        // holds the operation's lock; Monitor lets it straight back in.
+        provider.AfterLine = line =>
+        {
+            if (line.EventId == 9004 && line.Message.Contains("Succeeded", StringComparison.Ordinal))
+            {
+                operation.Success();
+            }
+        };
+        logger.Dispose();
+
+        List<int> ids = [.. provider.Lines.Select(static l => l.EventId)];
+        Assert.Contains(9001, ids);
+        Assert.DoesNotContain(9008, ids.SkipWhile(static id => id != 9001));
+    }
+
+    [Fact]
     public void A_throwing_provider_at_the_end_still_retires_the_operation()
     {
         using RecordingProvider provider = new() { ThrowWhen = l => l.EventId == 9001 };
@@ -565,6 +593,9 @@ internal sealed class RecordingProvider : ILoggerProvider, ISupportExternalScope
     /// <summary>Lines for which Log throws <see cref="InvalidOperationException"/> after recording nothing.</summary>
     public Func<RecordedLine, bool>? ThrowWhen { get; init; }
 
+    /// <summary>Called on the logging thread after each line is recorded, so a test can re-enter the library from a provider.</summary>
+    public Action<RecordedLine>? AfterLine { get; set; }
+
     public IReadOnlyList<RecordedLine> Lines
     {
         get
@@ -622,6 +653,8 @@ internal sealed class RecordingProvider : ILoggerProvider, ISupportExternalScope
             {
                 owner._lines.Add(line);
             }
+
+            owner.AfterLine?.Invoke(line);
         }
     }
 }

@@ -100,6 +100,43 @@ public sealed class ConfigurationTests
     }
 
     [Fact]
+    public void A_value_that_cannot_be_converted_is_rejected_like_an_invalid_one()
+    {
+        using Host host = new(Memory(("Defaults:EveryItems", "1000")));
+
+        // Must not throw into whoever raised the reload (a file watcher, in a real host).
+        host.Set("Defaults:EveryItems", "abc");
+
+        Assert.Equal(1000, host.Logger.DefaultOptions.EveryItems);
+        FakeLogRecord rejected = Assert.Single(host.Collector.GetSnapshot(), r => r.Id.Id == 9011);
+        Assert.IsType<InvalidOperationException>(rejected.Exception);
+
+        host.Set("Defaults:EveryItems", "3");
+        Assert.Equal(3, host.Logger.DefaultOptions.EveryItems);
+    }
+
+    [Fact]
+    public void A_value_that_cannot_be_converted_at_startup_still_throws()
+    {
+        IConfigurationRoot configuration = Memory(("Defaults:EveryItems", "abc"));
+
+        Assert.Throws<InvalidOperationException>(() => new Host(configuration));
+    }
+
+    [Theory]
+    [InlineData("00:00:00.0001", "00:00:00.0001")]   // below PeriodicTimer's one millisecond
+    [InlineData("00:00:01", "60.00:00:00")]          // above its limit of about 49.7 days
+    public void A_sweep_interval_the_timer_cannot_run_at_is_rejected(string minimum, string maximum)
+    {
+        using Host host = new(Memory(("MinimumSweepInterval", "00:00:01"), ("MaximumSweepInterval", "00:00:30")));
+
+        host.Set("MinimumSweepInterval", minimum);
+        host.Set("MaximumSweepInterval", maximum);
+
+        Assert.Contains(host.Collector.GetSnapshot(), r => r.Id.Id == 9011);
+    }
+
+    [Fact]
     public void A_change_to_a_named_instance_of_the_options_is_ignored()
     {
         IConfigurationRoot other = Memory(("Defaults:EveryItems", "5"));

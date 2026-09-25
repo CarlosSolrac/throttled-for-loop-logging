@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Runtime.ExceptionServices;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using ThrottledLogging.Internal;
@@ -391,7 +392,7 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
         {
             next = Settings.From(options);
         }
-        catch (ArgumentException error)
+        catch (Exception error) when (error is ArgumentException or InvalidOperationException)
         {
             IgnoreFailure(() => Log.SettingsReloadRejected(_selfLogger, error));
             return;
@@ -516,6 +517,9 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
     /// </summary>
     private sealed class Settings
     {
+        private static readonly TimeSpan ShortestTimerPeriod = TimeSpan.FromMilliseconds(1);
+        private static readonly TimeSpan LongestTimerPeriod = TimeSpan.FromMilliseconds(uint.MaxValue - 1);
+
         private Settings(OperationOptions defaults, Action<ThrottledEvent>? onEmitted, bool enableSweeper, TimeSpan minimumSweepInterval, TimeSpan maximumSweepInterval)
         {
             Defaults = defaults;
@@ -540,8 +544,14 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
         /// <param name="options">The settings.</param>
         /// <returns>The copy.</returns>
         /// <exception cref="ArgumentException">A setting is missing or out of range.</exception>
+        /// <exception cref="InvalidOperationException">Configuration held a value that could not be converted.</exception>
         public static Settings From(ThrottledLoggingOptions options)
         {
+            if (options.BindingError is { } bindingError)
+            {
+                ExceptionDispatchInfo.Throw(bindingError);
+            }
+
             if (options.Defaults is null)
             {
                 throw new ArgumentNullException(nameof(options), "Defaults must not be null.");
@@ -550,14 +560,21 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
             OperationOptions defaults = options.Defaults.Clone();
             defaults.Validate();
 
-            if (options.MinimumSweepInterval <= TimeSpan.Zero)
+            // The sweeper's PeriodicTimer accepts nothing outside this range; a period outside it
+            // would throw on the sweeper's thread and stop it for good.
+            if (options.MinimumSweepInterval < ShortestTimerPeriod)
             {
-                throw new ArgumentOutOfRangeException(nameof(options), options.MinimumSweepInterval, "MinimumSweepInterval must be greater than zero.");
+                throw new ArgumentOutOfRangeException(nameof(options), options.MinimumSweepInterval, "MinimumSweepInterval must be at least one millisecond.");
             }
 
             if (options.MaximumSweepInterval < options.MinimumSweepInterval)
             {
                 throw new ArgumentOutOfRangeException(nameof(options), options.MaximumSweepInterval, "MaximumSweepInterval must not be less than MinimumSweepInterval.");
+            }
+
+            if (options.MaximumSweepInterval > LongestTimerPeriod)
+            {
+                throw new ArgumentOutOfRangeException(nameof(options), options.MaximumSweepInterval, "MaximumSweepInterval must not exceed about 49.7 days.");
             }
 
             return new Settings(defaults, options.OnEmitted, options.EnableSweeper, options.MinimumSweepInterval, options.MaximumSweepInterval);

@@ -301,6 +301,14 @@ internal sealed class OperationScope : IOperationScope
             Emit(heldFailure, _options.FailureLevel, deferred);
         }
 
+        // A logging provider can end the operation while writing the lines above: it runs on this
+        // thread, which already holds the lifecycle lock, so End gets straight back in and writes
+        // the closing line. "Still running" after that would be false.
+        if (HasEnded)
+        {
+            return;
+        }
+
         OperationSnapshot snapshot = Snapshot();
         using IDisposable? scope = BeginContextScope();
         Log.OperationStillRunningAtShutdown(

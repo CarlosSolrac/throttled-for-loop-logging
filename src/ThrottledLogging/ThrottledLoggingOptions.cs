@@ -35,4 +35,11 @@ public sealed class ThrottledLoggingOptions
     /// that does, without deadlocking.
     /// </remarks>
     public Action<ThrottledEvent>? OnEmitted { get; set; }
+
+    /// <summary>
+    /// Set when configuration could not be bound, for instance a number that is not a number, so
+    /// the logger can reject these settings and keep the last good ones. Not public, so the
+    /// configuration binder never touches it.
+    /// </summary>
+    internal Exception? BindingError { get; set; }
 }

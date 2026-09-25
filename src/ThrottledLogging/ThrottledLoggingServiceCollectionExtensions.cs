@@ -53,7 +53,24 @@ public static class ThrottledLoggingServiceCollectionExtensions
         ArgumentNullException.ThrowIfNull(services);
         ArgumentNullException.ThrowIfNull(configuration);
 
-        OptionsBuilder<ThrottledLoggingOptions> options = services.AddOptions<ThrottledLoggingOptions>().Bind(configuration);
+        // What OptionsBuilder.Bind does, except that a value the binder cannot convert is recorded
+        // rather than thrown. Thrown, it would escape from the options monitor into whatever raised
+        // the reload (a file watcher, in most hosts), before the logger could reject it and keep
+        // the last good settings. The logger still throws it at startup.
+        OptionsBuilder<ThrottledLoggingOptions> options = services.AddOptions<ThrottledLoggingOptions>()
+            .Configure(target =>
+            {
+                try
+                {
+                    configuration.Bind(target);
+                }
+                catch (InvalidOperationException error)
+                {
+                    target.BindingError = error;
+                }
+            });
+        services.AddSingleton<IOptionsChangeTokenSource<ThrottledLoggingOptions>>(new ConfigurationChangeTokenSource<ThrottledLoggingOptions>(configuration));
+
         if (configure is not null)
         {
             options.Configure(configure);
