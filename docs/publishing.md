@@ -91,8 +91,12 @@ That is all. When CI passes on the merge commit, the Release workflow starts on 
 
 What gets published is the newest commit on `main` whose CI passed, not necessarily the commit
 that changed the version. If two pull requests merge close together, the release is built from
-the later one, once; the run for the earlier one sees that `main` has moved on and stands aside.
-If you bump the version twice before either is released, only the second version is published.
+the later one, once. A run for an older commit either releases the newest commit instead (when
+that commit's CI has already passed) or stands aside for that commit's own run, and just before
+pushing, the workflow checks `main` again and stands aside if it moved while building or
+waiting for approval. If the newest commit's CI fails, nothing is released until a later commit
+on `main` passes. If you bump the version twice before either is released, only the second
+version is published.
 
 A merge that leaves the version alone releases nothing: the workflow sees the version is already
 out and stops with a notice. So does a failed CI run, which never reaches the release at all;
@@ -111,9 +115,13 @@ waiting for CI. It does only the steps that are still missing:
 
 - a version not on NuGet.org yet is built from `main`, published, tagged and released;
 - a version already on NuGet.org without a GitHub release (the release step failed) gets its tag
-  and release on the commit recorded inside the published package, with the package downloaded
-  from NuGet.org attached. It is never rebuilt from whatever `main` is now. The next green CI run
-  on `main` does this too, without asking.
+  and release on the commit recorded inside the published package, with the package and symbols
+  downloaded from NuGet.org attached. It is never rebuilt from whatever `main` is now. The next
+  green CI run on `main` does this too, without asking.
+
+Only the version `main` currently carries is looked at. If a release step failed and `main` has
+since moved to a newer version, create the older tag and release by hand: the commit is in the
+`<repository commit="…">` element of the package's `.nuspec` on NuGet.org.
 
 ### When something fails
 
@@ -123,13 +131,17 @@ waiting for CI. It does only the steps that are still missing:
   Fix them, then re-run the failed jobs of that Release run, or run the workflow by hand.
 - **NuGet.org says the version already exists.** The workflow downloads the package that is
   there. If it was built from the same commit (a re-run after a push that went through), the
-  release carries on. If not, it stops: change `<Version>` and merge again.
+  release carries on and attaches the package NuGet.org serves. If not, it stops: change
+  `<Version>` and merge again.
 - **The package is on NuGet.org but the tag or GitHub release is missing.** The next green CI run
   on `main` finishes it, or run the workflow by hand.
 - **"Tag vX already exists on another commit."** A tag with this version exists but nothing was
   published under it. Delete the tag if it was pushed by mistake, or change `<Version>`.
-- **A draft GitHub release for the tag exists.** Publish or delete the draft, then run the
+- **A draft GitHub release for the tag exists.** Usually a release step that died halfway, since
+  `gh release create` makes a draft, uploads, then publishes. Delete the draft, then run the
   workflow by hand.
+- **"Tag vX is on one commit, but the package was built from another."** The tag was moved or
+  made by hand. Move it to the commit named in the error.
 
 ## Rehearsing
 

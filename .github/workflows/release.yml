@@ -58,6 +58,9 @@ jobs:
   plan:
     name: Decide what to release
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read   # to ask whether CI passed on the newest commit of main
     # A CI run counts only when it passed and was a push to main in this repository, never a
     # pull request (including one from a fork whose branch happens to be named main).
     if: >-
@@ -85,11 +88,34 @@ jobs:
         env:
           RUN_SHA: ${{ github.event.workflow_run.head_sha }}
           DRY_RUN_INPUT: ${{ inputs.dry-run }}
+          GH_TOKEN: ${{ github.token }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
         run: |
           set -euo pipefail
+          skip=false
           if [ "${GITHUB_EVENT_NAME}" = "workflow_run" ]; then
             sha="${RUN_SHA}"
             dry_run=false
+            # Only the newest commit on main is released. When main has moved past the commit
+            # CI just passed, release the newest one instead if its CI has passed too: GitHub
+            # keeps a single pending run per concurrency group, so that commit's own release
+            # run may have been replaced by this one. If its CI has not passed yet, its own
+            # run is still to come, and this one stands aside.
+            main_sha=$(git ls-remote "${REPO_URL}" refs/heads/main | cut -f1)
+            if [ -z "${main_sha}" ]; then
+              echo "::error::Could not read the tip of main."
+              exit 1
+            fi
+            if [ "${main_sha}" != "${sha}" ]; then
+              green=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${main_sha}&event=push&status=success" --jq '.total_count')
+              if [ "${green}" -gt 0 ]; then
+                echo "::notice::main has moved on from ${sha} to ${main_sha}, whose CI has passed; planning for that commit."
+                sha="${main_sha}"
+              else
+                echo "::notice::main has moved on from ${sha} to ${main_sha}; the release run for that commit takes over once its CI passes."
+                skip=true
+              fi
+            fi
           else
             sha="${GITHUB_SHA}"
             dry_run="${DRY_RUN_INPUT:-false}"
@@ -100,6 +126,7 @@ jobs:
           fi
           echo "sha=${sha}" >> "$GITHUB_OUTPUT"
           echo "dry-run=${dry_run}" >> "$GITHUB_OUTPUT"
+          echo "skip=${skip}" >> "$GITHUB_OUTPUT"
 
       - name: Check out
         uses: actions/checkout@v5
@@ -118,6 +145,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ steps.commit.outputs.sha }}
           DRY_RUN: ${{ steps.commit.outputs.dry-run }}
+          SKIP: ${{ steps.commit.outputs.skip }}
           REPO_URL: ${{ github.server_url }}/${{ github.repository }}
         run: |
           set -euo pipefail
@@ -134,6 +162,34 @@ jobs:
           tag="v${version}"
           prerelease=false
           if [[ "${version}" == *-* ]]; then prerelease=true; fi
+
+          write_outputs() {
+            {
+              echo "sha=${SHA}"
+              echo "version=${version}"
+              echo "tag=${tag}"
+              echo "prerelease=${prerelease}"
+              echo "build=${build}"
+              echo "publish=${publish}"
+              echo "release=${release}"
+              echo "assets-from=${assets_from}"
+            } >> "$GITHUB_OUTPUT"
+          }
+
+          build=false; publish=false; release=false; assets_from=build
+          if [ "${SKIP}" = "true" ]; then
+            write_outputs
+            exit 0
+          fi
+
+          # A dry run builds, tests and packs the commit it was started on, and nothing else,
+          # so it does not depend on what NuGet.org or GitHub say.
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "::notice::Dry run of ${PACKAGE_ID} ${version}: nothing will be published, tagged or released."
+            build=true; publish=false; release=false; assets_from=build
+            write_outputs
+            exit 0
+          fi
 
           # Is this version on NuGet.org? The flat container lists every version of a package
           # in lower case and answers 404 for a package that has never been pushed. Anything
@@ -154,7 +210,11 @@ jobs:
           # Is there a GitHub release? Only a 404 means no; any other failure stops the run.
           if release_json=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" 2> "${work}/gh-error.txt"); then
             has_release=true
-            if [ "$(echo "${release_json}" | jq -r .draft)" = "true" ]; then
+            if ! draft=$(echo "${release_json}" | jq -r 'if (.draft | type) == "boolean" then .draft else error("no draft field") end'); then
+              echo "::error::GitHub returned an unreadable answer for release ${tag}."
+              exit 1
+            fi
+            if [ "${draft}" = "true" ]; then
               echo "::error::A draft GitHub release for ${tag} exists. Publish or delete it, then run the Release workflow again."
               exit 1
             fi
@@ -170,15 +230,21 @@ jobs:
           tag_sha=$(git ls-remote "${REPO_URL}" "refs/tags/${tag}" "refs/tags/${tag}^{}" \
             | awk '$2 ~ /\^\{\}$/ { peeled = $1 } { plain = $1 } END { print (peeled != "" ? peeled : plain) }')
 
-          build=false; publish=false; release=false; assets_from=build
           if [ "${has_release}" = "true" ]; then
-            # The release job runs only after a successful push, so a release means the
-            # version is out even while NuGet.org's index is still catching up.
+            # This workflow creates a release only after a successful push, so a release means
+            # the version is out, even while NuGet.org's index is still catching up. Anything
+            # inconsistent is reported rather than papered over.
             echo "::notice::${PACKAGE_ID} ${version} is already released; nothing to do. Change <Version> in Directory.Build.props to release a new version."
-            if [ "${published}" = "true" ] && [ -n "${tag_sha}" ]; then
+            if [ "${published}" = "false" ]; then
+              echo "::warning::GitHub has release ${tag}, but NuGet.org does not list ${PACKAGE_ID} ${version}. That is normal for a few minutes after a release; if it persists, the release was made by hand and the package was never published."
+            elif [ -z "${tag_sha}" ]; then
+              echo "::error::GitHub has release ${tag}, but the tag does not exist."
+              exit 1
+            else
               commit=$(published_commit)
-              if [ -n "${commit}" ] && [ "${commit}" != "${tag_sha}" ]; then
-                echo "::warning::Tag ${tag} is on ${tag_sha}, but the package on NuGet.org was built from ${commit}."
+              if [ "${commit}" != "${tag_sha}" ]; then
+                echo "::error::Tag ${tag} is on ${tag_sha}, but ${PACKAGE_ID} ${version} on NuGet.org was built from '${commit}'. Move the tag to the published commit."
+                exit 1
               fi
             fi
           elif [ "${published}" = "true" ]; then
@@ -198,38 +264,16 @@ jobs:
             release=true; assets_from=nuget
             echo "::notice::${PACKAGE_ID} ${version} is on NuGet.org without a GitHub release; creating ${tag} on ${commit}, the commit it was built from."
           else
-            # A new version. Only the newest commit on main is published, so two merges in a
-            # row release the later one once, and a slow CI run on an older commit cannot
-            # publish code that main has already moved past.
-            main_sha=$(git ls-remote "${REPO_URL}" refs/heads/main | cut -f1)
-            if [ "${GITHUB_EVENT_NAME}" = "workflow_run" ] && [ "${main_sha}" != "${SHA}" ]; then
-              echo "::notice::main has moved on from ${SHA} to ${main_sha}; the run for that commit releases ${version}."
-            elif [ -n "${tag_sha}" ] && [ "${tag_sha}" != "${SHA}" ] && [ "${DRY_RUN}" != "true" ]; then
+            # A new version, on the newest green commit of main (see "Resolve the commit").
+            if [ -n "${tag_sha}" ] && [ "${tag_sha}" != "${SHA}" ]; then
               echo "::error::Tag ${tag} already exists on ${tag_sha}, not on ${SHA}, but ${PACKAGE_ID} ${version} is not on NuGet.org. Delete the tag if it was pushed by mistake, or change <Version>."
               exit 1
-            else
-              build=true; publish=true; release=true
-              echo "::notice::Releasing ${PACKAGE_ID} ${version} from ${SHA}."
             fi
+            build=true; publish=true; release=true
+            echo "::notice::Releasing ${PACKAGE_ID} ${version} from ${SHA}."
           fi
 
-          # A dry run builds, tests and packs the commit it was started on, and stops there.
-          if [ "${DRY_RUN}" = "true" ]; then
-            echo "::notice::Dry run: nothing will be published, tagged or released."
-            SHA="${GITHUB_SHA}"
-            build=true; publish=false; release=false; assets_from=build
-          fi
-
-          {
-            echo "sha=${SHA}"
-            echo "version=${version}"
-            echo "tag=${tag}"
-            echo "prerelease=${prerelease}"
-            echo "build=${build}"
-            echo "publish=${publish}"
-            echo "release=${release}"
-            echo "assets-from=${assets_from}"
-          } >> "$GITHUB_OUTPUT"
+          write_outputs
 
   # Builds, tests and packs with read-only access and no way to reach NuGet.org, so repository
   # code never runs where a publishing credential could be minted.
@@ -310,8 +354,35 @@ jobs:
       # API key. The job checks out nothing and runs no repository code.
       id-token: write
 
+    outputs:
+      pushed: ${{ steps.push.outputs.pushed }}
+      served-by-nuget: ${{ steps.push.outputs.served-by-nuget }}
+
     steps:
+      # The build and a possible approval wait take time, and main may have moved on meanwhile.
+      # Publishing is irreversible, so check again right before it: if main has a newer commit,
+      # this run stands aside and that commit's release run, queued behind this one, releases.
+      - name: Confirm this is still the newest commit on main
+        id: still-newest
+        env:
+          SHA: ${{ needs.plan.outputs.sha }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          main_sha=$(git ls-remote "${REPO_URL}" refs/heads/main | cut -f1)
+          if [ -z "${main_sha}" ]; then
+            echo "::error::Could not read the tip of main."
+            exit 1
+          fi
+          if [ "${main_sha}" = "${SHA}" ]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::main moved on to ${main_sha} while this run was building or waiting; not publishing ${SHA}. The release run for the newer commit publishes instead."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Download package
+        if: steps.still-newest.outputs.proceed == 'true'
         uses: actions/download-artifact@v6
         with:
           name: nupkg-${{ needs.plan.outputs.version }}
@@ -323,12 +394,14 @@ jobs:
       # NUGET_API_KEY secret.
       - name: Request a short-lived NuGet API key
         id: nuget-login
-        if: vars.NUGET_USER != ''
+        if: steps.still-newest.outputs.proceed == 'true' && vars.NUGET_USER != ''
         uses: NuGet/login@v1
         with:
           user: ${{ vars.NUGET_USER }}
 
       - name: Push
+        id: push
+        if: steps.still-newest.outputs.proceed == 'true'
         env:
           # The short-lived key when trusted publishing is configured, the stored secret otherwise.
           NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY || secrets.NUGET_API_KEY }}
@@ -343,9 +416,10 @@ jobs:
           package="artifacts/${PACKAGE_ID}.${VERSION}.nupkg"
           # A matching .snupkg beside the .nupkg is pushed with it automatically.
           if dotnet nuget push "${package}" --api-key "${NUGET_API_KEY}" --source https://api.nuget.org/v3/index.json 2>&1 | tee push.log; then
+            echo "pushed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if ! grep -q '409' push.log; then
+          if ! grep -q 'does not indicate success: 409' push.log; then
             exit 1
           fi
 
@@ -359,7 +433,11 @@ jobs:
             if curl -sSfL -o published.nupkg "${url}"; then
               commit=$(unzip -p published.nupkg '*.nuspec' | sed -n 's:.*<repository [^>]*commit="\([0-9a-f]\{40\}\)".*:\1:p' | head -1)
               if [ "${commit}" = "${SHA}" ]; then
+                # The GitHub release then attaches the package NuGet.org serves, not this
+                # run's rebuild of it, which need not be byte-for-byte the same.
                 echo "::notice::${PACKAGE_ID} ${VERSION} was already on NuGet.org, built from this same commit; continuing."
+                echo "pushed=true" >> "$GITHUB_OUTPUT"
+                echo "served-by-nuget=true" >> "$GITHUB_OUTPUT"
                 exit 0
               fi
               echo "::error::${PACKAGE_ID} ${VERSION} is already on NuGet.org, built from '${commit}', not ${SHA}. Change <Version> and release again."
@@ -379,7 +457,7 @@ jobs:
     if: >-
       !cancelled() &&
       needs.plan.outputs.release == 'true' &&
-      (needs.publish.result == 'success' ||
+      ((needs.publish.result == 'success' && needs.publish.outputs.pushed == 'true') ||
        (needs.plan.outputs.assets-from == 'nuget' && needs.publish.result == 'skipped'))
     runs-on: ubuntu-latest
 
@@ -388,15 +466,16 @@ jobs:
 
     steps:
       - name: Download package from this run
-        if: needs.plan.outputs.assets-from == 'build'
+        if: needs.plan.outputs.assets-from == 'build' && needs.publish.outputs.served-by-nuget != 'true'
         uses: actions/download-artifact@v6
         with:
           name: nupkg-${{ needs.plan.outputs.version }}
           path: artifacts
 
-      # Finishing an earlier release: attach the package exactly as NuGet.org serves it.
+      # Finishing an earlier release, or one whose package was already on NuGet.org: attach
+      # the package exactly as NuGet.org serves it, and its symbols when NuGet.org has them.
       - name: Download package from NuGet.org
-        if: needs.plan.outputs.assets-from == 'nuget'
+        if: needs.plan.outputs.assets-from == 'nuget' || needs.publish.outputs.served-by-nuget == 'true'
         env:
           VERSION: ${{ needs.plan.outputs.version }}
         run: |
@@ -405,6 +484,11 @@ jobs:
           mkdir -p artifacts
           curl -sSfL -o "artifacts/${PACKAGE_ID}.${VERSION}.nupkg" \
             "https://api.nuget.org/v3-flatcontainer/${PACKAGE_ID_LOWER}/${version_lower}/${PACKAGE_ID_LOWER}.${version_lower}.nupkg"
+          if ! curl -sSfL -o "artifacts/${PACKAGE_ID}.${VERSION}.snupkg" \
+            "https://www.nuget.org/api/v2/symbolpackage/${PACKAGE_ID}/${VERSION}"; then
+            rm -f "artifacts/${PACKAGE_ID}.${VERSION}.snupkg"
+            echo "::warning::NuGet.org did not serve the symbol package for ${VERSION}; the release carries the .nupkg only."
+          fi
 
       # gh creates the tag on the given commit when it does not exist yet. A tag created with
       # the workflow's own token does not start other workflows, so this cannot loop.

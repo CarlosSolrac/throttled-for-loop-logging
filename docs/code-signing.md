@@ -17,15 +17,17 @@ once the free subscription is granted.
 
 ## What the release workflow needs to add
 
-Signing happens in the release workflow's `publish` job, after it downloads the package that the
-`build` job packed and before it pushes to NuGet, so that what is published is the signed package.
-The SignPath action needs the id of an uploaded artifact, so upload the build job's package with an
-`id` on that step and pass its `artifact-id` output on. The `github-release` job attaches the
-artifact named `nupkg-<version>`, so after signing, upload the signed package under that name with
-`overwrite: true`; otherwise the GitHub release would carry the unsigned one.
+Signing happens in the release workflow's `publish` job, after the `build` job has packed and
+uploaded the package and before the push, so that what is published is the signed package. The
+SignPath action takes the id of an uploaded artifact, so the `build` job exposes it as an output.
+The signed package goes to its own folder, is checked, and is then both pushed and re-uploaded
+under the artifact name the `github-release` job attaches, so NuGet.org and the GitHub release
+carry the same signed file.
 
 ```yaml
 build:
+  outputs:
+    unsigned-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
   steps:
     # ... checkout, setup-dotnet, restore, build, test, pack into artifacts/, check the package ...
 
@@ -38,8 +40,6 @@ build:
           artifacts/*.nupkg
           artifacts/*.snupkg
         if-no-files-found: error
-  outputs:
-    unsigned-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
 
 publish:
   permissions:
@@ -47,6 +47,8 @@ publish:
     id-token: write        # NuGet trusted publishing, as today
   timeout-minutes: 120     # waits for a human to approve the signing request
   steps:
+    # ... "Confirm this is still the newest commit on main", as today ...
+
     - name: Submit signing request
       uses: signpath/github-action-submit-signing-request@v2
       with:
@@ -57,20 +59,29 @@ publish:
         artifact-configuration-slug: nupkg
         github-artifact-id: ${{ needs.build.outputs.unsigned-artifact-id }}
         wait-for-completion: true
-        output-artifact-directory: artifacts
+        output-artifact-directory: artifacts-signed
 
-    # Replace the unsigned artifact, so the GitHub release attaches what NuGet.org gets.
-    - name: Upload signed package
+    # The signed package must still be this version, built from this commit.
+    - name: Check the signed package
+      run: |
+        set -euo pipefail
+        package="artifacts-signed/${PACKAGE_ID}.${VERSION}.nupkg"
+        test -f "${package}"
+        unzip -l "${package}" | grep -q '\.signature\.p7s$'
+        unzip -p "${package}" '*.nuspec' | grep -q "commit=\"${SHA}\""
+
+    - name: Replace the artifact with the signed package
       uses: actions/upload-artifact@v6
       with:
         name: nupkg-${{ needs.plan.outputs.version }}
         path: |
-          artifacts/*.nupkg
+          artifacts-signed/*.nupkg
           artifacts/*.snupkg
         overwrite: true
         if-no-files-found: error
 
-    # ... then the existing NuGet login and Push steps, unchanged ...
+    # ... then the existing NuGet login and Push steps, with the package path changed to
+    # artifacts-signed/ and the .snupkg copied next to it so it is pushed alongside ...
 ```
 
 Notes that matter:
@@ -89,30 +100,35 @@ Notes that matter:
 
 ## Artifact configuration
 
-The artifact configuration is created in SignPath, not in this repository. A NuGet package of a
-multi-targeted library signs the assemblies inside the package and then the package itself, and
-pins the metadata that the conditions require:
+The artifact configuration is created in SignPath, not in this repository. A GitHub artifact
+reaches SignPath as the ZIP that `actions/upload-artifact` makes, holding the `.nupkg` and the
+`.snupkg`, so the root is a `<zip-file>` with the package nested inside it. The configuration signs
+the assemblies inside the package and then the package itself, pins the metadata that the
+conditions require, and leaves the symbol package as it is:
 
 ```xml
 <artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
-  <nupkg-file>
-    <nuget-sign />
-    <directory path="lib">
-      <directory path="net8.0">
-        <pe-file path="ThrottledLogging.dll" product-name="ThrottledForLoopLogging" product-version="0.1.0-alpha">
-          <authenticode-sign />
-        </pe-file>
+  <zip-file>
+    <nupkg-file path="ThrottledForLoopLogging.*.nupkg">
+      <nuget-sign />
+      <directory path="lib">
+        <directory path="net8.0">
+          <pe-file path="ThrottledLogging.dll" product-name="ThrottledForLoopLogging" product-version="0.2.0">
+            <authenticode-sign />
+          </pe-file>
+        </directory>
+        <directory path="net10.0">
+          <pe-file path="ThrottledLogging.dll" product-name="ThrottledForLoopLogging" product-version="0.2.0">
+            <authenticode-sign />
+          </pe-file>
+        </directory>
       </directory>
-      <directory path="net10.0">
-        <pe-file path="ThrottledLogging.dll" product-name="ThrottledForLoopLogging" product-version="0.1.0-alpha">
-          <authenticode-sign />
-        </pe-file>
-      </directory>
-    </directory>
-  </nupkg-file>
+    </nupkg-file>
+  </zip-file>
 </artifact-configuration>
 ```
 
+`product-version` must equal `<Version>` in `Directory.Build.props` for the release being signed.
 Check the element names against the
 [artifact configuration reference](https://docs.signpath.io/artifact-configuration/reference) when you
 paste it in, and parameterise the version rather than hard-coding it if you would rather not edit the
