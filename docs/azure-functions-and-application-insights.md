@@ -916,8 +916,11 @@ public sealed class DurableImport
 
         // A repeated request finds the earlier run. One still under way, or one that finished
         // successfully, is left alone: some Durable backends let a finished instance id be scheduled
-        // again, which would import the batch twice. A run that failed or was terminated is started
-        // again, which is what a retried request is for.
+        // again, which would import the batch twice. A run that failed or was terminated is
+        // scheduled again, which is what a retried request is for; whether the backend accepts a
+        // reused id is up to the backend, and if it refuses, the exception fails this invocation and
+        // the queue retries it. (ContinuedAsNew is not listed: this SDK marks it obsolete and never
+        // reports it.)
         OrchestrationMetadata? existing = await client.GetInstanceAsync(instanceId, context.CancellationToken);
         if (existing?.RuntimeStatus is OrchestrationRuntimeStatus.Pending or OrchestrationRuntimeStatus.Running or OrchestrationRuntimeStatus.Suspended or OrchestrationRuntimeStatus.Completed)
         {
@@ -1167,7 +1170,8 @@ for long runs.
 - **New events:** 9008 (still running at shutdown, Warning), 9009 (a shutdown flush failed,
   Warning), 9010 (the sweeper did not stop within five seconds, Warning), 9011 (reloaded settings
   were rejected, Warning), 9012 (a logging provider threw while the sweeper wrote a held line, Warning;
-  that line is lost, but the sweeper keeps running where it used to stop for good).
+  that line is lost, but the sweeper keeps running where it used to stop for good), 9013 (a second
+  `Dispose` stopped waiting for an earlier one that is still writing, Warning).
 - **New API:** `OperationOptions.Scope`; `AddThrottledLogging(IConfiguration, Action<ThrottledLoggingOptions>?)`
   to bind settings from configuration and follow reloads; an `OperationLogger` constructor taking
   `IOptionsMonitor<ThrottledLoggingOptions>`. Nothing was removed and no default changed.

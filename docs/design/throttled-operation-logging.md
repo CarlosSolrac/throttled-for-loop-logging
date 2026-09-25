@@ -816,4 +816,17 @@ default context on the disposing thread, so shutdown never waits on the thread p
 at a time and each reads the monitor's current value, so racing change callbacks cannot restore
 older settings. The sweeper re-checks, under the channel gate, that its interval is still due, so
 it cannot repeat an event a submitter wrote a moment before. An item completed after its operation
-ended is ignored.
+ended is ignored. A second `Dispose` that gives up waiting says so with event 9013.
+
+Known limits, accepted rather than paid for on the hot path or in shutdown time:
+
+- An item completing on another thread at the very instant the operation ends can slip past the
+  "already ended" check and write one line after the closing line. Closing that would put the
+  lifecycle lock on every item completion; ending an operation with items still running is a
+  caller error in any case.
+- `OnEmitted` keeps write order within one thread's hold of the lock, including reentrant
+  providers. Across threads it can be called concurrently, as it always could from submitters.
+- A provider that disposes the logger from inside an entry line gets its shutdown flush after
+  that line; a second `Dispose` racing it on another thread may return before that flush is done.
+- A logging provider that hangs on the disposing thread itself hangs `Dispose`.
+- `services.AddThrottledLogging(null)` with a bare `null` is ambiguous between the two overloads.

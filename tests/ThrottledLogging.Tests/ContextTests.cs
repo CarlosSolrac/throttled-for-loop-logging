@@ -444,7 +444,9 @@ public sealed class ContextTests
             }
 
             // Tick the real sweeper until the held event goes out as a heartbeat.
-            for (int i = 0; i < 100 && !provider.Lines.Any(l => l.EventId == 9004 && l.Message.Contains("Succeeded", StringComparison.Ordinal)); i++)
+            // A real-time bound rather than an iteration count, so a slow machine only makes it slower.
+            Stopwatch waited = Stopwatch.StartNew();
+            while (!provider.Lines.Any(l => l.EventId == 9004 && l.Message.Contains("Succeeded", StringComparison.Ordinal)) && waited.Elapsed < TimeSpan.FromSeconds(30))
             {
                 time.Advance(TimeSpan.FromSeconds(1));
                 await Task.Delay(20, TestContext.Current.CancellationToken);
@@ -712,11 +714,17 @@ public sealed class ContextTests
         Assert.DoesNotContain(true, lockHeldDuringNotification);
     }
 
-    [Fact]
-    public void Shutdown_flush_of_an_operation_that_captured_nothing_runs_on_the_disposing_thread()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Shutdown_flush_of_an_operation_that_captured_nothing_runs_on_the_disposing_thread_in_an_empty_context(bool providerThrows)
     {
-        // No thread-pool hop, so a starved pool cannot hold up shutdown.
+        // No thread-pool hop, so a starved pool cannot hold up shutdown; and none of the disposing
+        // thread's own context leaks into the line, nor is lost from that thread afterwards, even
+        // when the provider throws.
         int? flushThread = null;
+        string? ambientDuringFlush = "not written";
+        string? activityDuringFlush = "not written";
         using RecordingProvider provider = new()
         {
             AfterLine = l =>
@@ -724,6 +732,12 @@ public sealed class ContextTests
                 if (l.EventId == 9008)
                 {
                     flushThread = Environment.CurrentManagedThreadId;
+                    ambientDuringFlush = RequestLabel.Value;
+                    activityDuringFlush = Activity.Current?.OperationName;
+                    if (providerThrows)
+                    {
+                        throw new InvalidOperationException("provider failure");
+                    }
                 }
             },
         };
@@ -735,10 +749,96 @@ public sealed class ContextTests
             operation = logger.BeginOperation("ImportOrders");
         }
 
-        logger.Dispose();
+        RequestLabel.Value = "disposing-request";
+        using Activity disposing = new Activity("DisposingInvocation").Start();
+        using (factory.CreateLogger("Host").BeginScope(new Dictionary<string, object?> { ["InvocationId"] = "disposing" }))
+        {
+            logger.Dispose();
+        }
 
         Assert.Equal(Environment.CurrentManagedThreadId, flushThread);
+        Assert.Null(ambientDuringFlush);
+        Assert.Null(activityDuringFlush);
+        Assert.DoesNotContain(provider.Lines.Single(static l => l.EventId == 9008).Pairs, static p => p.Key == "InvocationId");
+        Assert.Equal("disposing-request", RequestLabel.Value);
+        Assert.Same(disposing, Activity.Current);
         operation.Dispose();
+    }
+
+    private static readonly AsyncLocal<string?> RequestLabel = new();
+
+    [Fact]
+    public void A_second_dispose_that_gives_up_waiting_says_so()
+    {
+        using ManualResetEventSlim writing = new(initialState: false);
+        using ManualResetEventSlim release = new(initialState: false);
+        using RecordingProvider provider = new()
+        {
+            AfterLine = l =>
+            {
+                if (l.EventId == 9008)
+                {
+                    writing.Set();
+                    release.Wait(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+                }
+            },
+        };
+        using ILoggerFactory factory = LoggerFactory.Create(builder => builder.AddProvider(provider));
+        OperationLogger logger = new(factory, new ThrottledLoggingOptions { EnableSweeper = false }, TimeProvider.System)
+        {
+            SweeperStopTimeout = TimeSpan.FromMilliseconds(100),
+            ShutdownLockTimeout = TimeSpan.FromMilliseconds(100),
+        };
+        using IOperationScope operation = logger.BeginOperation("ImportOrders");
+        Thread first = new(logger.Dispose) { IsBackground = true };
+        first.Start();
+        Assert.True(writing.Wait(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken));
+
+        logger.Dispose();   // gives up after 200 ms: the first is still stuck in the provider
+
+        Assert.Single(provider.Lines, static l => l.EventId == 9013);
+        release.Set();
+        Assert.True(first.Join(TimeSpan.FromSeconds(10)));
+    }
+
+    [Fact]
+    public void Observer_hears_about_lines_in_the_order_they_were_written_when_a_provider_ends_the_operation_from_inside_a_sweep()
+    {
+        List<ItemOutcome> notified = [];
+        IOperationScope? operation = null;
+        bool ended = false;
+        using RecordingProvider provider = new()
+        {
+            AfterLine = l =>
+            {
+                if (l.EventId == 9004 && l.Message.Contains("order-2", StringComparison.Ordinal) && !ended)
+                {
+                    ended = true;
+                    operation!.Success();   // writes the held failure after this progress line
+                }
+            },
+        };
+        using ILoggerFactory factory = LoggerFactory.Create(builder => builder.AddProvider(provider));
+        FakeTimeProvider time = new(new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero));
+        using OperationLogger logger = new(factory, new ThrottledLoggingOptions { EnableSweeper = false, OnEmitted = e => notified.Add(e.Outcome) }, time);
+        operation = logger.BeginOperation("ImportOrders");
+        using (IItemScope first = operation.BeginItem("order-1"))
+        {
+            first.Failure(new InvalidOperationException("first"));
+        }
+
+        using (IItemScope second = operation.BeginItem("order-2"))
+        {
+            second.Failure(new InvalidOperationException("second"));
+        }
+
+        time.Advance(TimeSpan.FromMinutes(1));
+        notified.Clear();
+        logger.SweepOnce();
+
+        List<int> written = [.. provider.Lines.Where(static l => l.EventId is 9004 or 9005).Select(static l => l.EventId)];
+        Assert.Equal([9004, 9005], written[^2..]);
+        Assert.Equal([ItemOutcome.Started, ItemOutcome.Failed], notified);
     }
 
     [Fact]

@@ -34,7 +34,8 @@ internal sealed class OperationScope : IOperationScope
     // outermost holder once it lets go. The lock is reentrant (a logging provider called under it may
     // end the operation, which takes it again), so an inner holder releasing its own entry must not
     // deliver them: the outer entry still holds the lock. Only touched by the thread holding the lock.
-    private List<ThrottledEvent>? _heldNotifications;
+    // A slot stays null only if the provider write for it threw; NotifyDeferred skips those.
+    private List<ThrottledEvent?>? _heldNotifications;
 
     // True while BeginOperation holds the lock to write the entry line. A shutdown flush that gets
     // in then can only be reentrant (a provider disposing the logger from inside the entry line), and
@@ -402,7 +403,7 @@ internal sealed class OperationScope : IOperationScope
     /// <param name="outermost">What <see cref="EnterLock"/> returned.</param>
     private void ExitLock(bool outermost)
     {
-        List<ThrottledEvent>? held = null;
+        List<ThrottledEvent?>? held = null;
         if (outermost)
         {
             held = _heldNotifications;
@@ -515,6 +516,17 @@ internal sealed class OperationScope : IOperationScope
         OperationSnapshot snapshot = Snapshot();
         PendingEvent pending = emission.Event;
 
+        // Under the lock, the notification's place in line is taken before the provider is called.
+        // A provider that re-enters the operation (ending it, say) writes its own lines after this
+        // one, and its notifications must come after this one too.
+        int slot = -1;
+        if (Monitor.IsEntered(_lifecycleGate))
+        {
+            _heldNotifications ??= [];
+            slot = _heldNotifications.Count;
+            _heldNotifications.Add(null);
+        }
+
         // The operation's scope covers the log call only. OnEmitted below runs outside it, so a
         // callback that begins another operation does not capture this one's scope, and one that
         // ends this operation does not open it a second time around the closing lines.
@@ -537,9 +549,9 @@ internal sealed class OperationScope : IOperationScope
             Progress = snapshot,
         };
 
-        if (Monitor.IsEntered(_lifecycleGate))
+        if (slot >= 0)
         {
-            (_heldNotifications ??= []).Add(emitted);
+            _heldNotifications![slot] = emitted;
         }
         else
         {
@@ -559,16 +571,19 @@ internal sealed class OperationScope : IOperationScope
     /// before, just a moment later, and anything it does to the operation (including ending it)
     /// happens after the lines already written, never interleaved with them.
     /// </remarks>
-    private void NotifyDeferred(List<ThrottledEvent>? deferred)
+    private void NotifyDeferred(List<ThrottledEvent?>? deferred)
     {
         if (deferred is null)
         {
             return;
         }
 
-        foreach (ThrottledEvent emitted in deferred)
+        foreach (ThrottledEvent? emitted in deferred)
         {
-            _owner.NotifyEmitted(emitted);
+            if (emitted is not null)
+            {
+                _owner.NotifyEmitted(emitted);
+            }
         }
     }
 

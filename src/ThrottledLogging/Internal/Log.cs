@@ -111,6 +111,11 @@ internal static partial class Log
     [LoggerMessage(EventId = 9012, Level = LogLevel.Warning, Message = "Sweeping {OperationName} ({OperationId}) failed; the sweeper keeps running.")]
     public static partial void SweepFailed(ILogger logger, Exception error, string operationName, Guid operationId);
 
+    // Written by a Dispose call made while another is still flushing, when the first has not finished
+    // within the bound. The second call returns anyway rather than hang host shutdown.
+    [LoggerMessage(EventId = 9013, Level = LogLevel.Warning, Message = "Dispose returned after waiting {WaitedSeconds:N1}s for an earlier Dispose that is still writing to the logging providers.")]
+    public static partial void SecondDisposeTimedOut(ILogger logger, double waitedSeconds);
+
     [LoggerMessage(EventId = 9007, Level = LogLevel.Debug, Message = "A ThrottledLogging observer threw and was ignored.")]
     public static partial void ObserverThrew(ILogger logger, Exception error);
 }

@@ -227,6 +227,22 @@ public sealed class ConfigurationTests
         Assert.Equal(3, logger.DefaultOptions.EveryItems);
     }
 
+    [Fact]
+    public void Validation_the_application_registered_rejecting_a_reload_is_logged_not_thrown()
+    {
+        StubMonitor monitor = new(new ThrottledLoggingOptions { EnableSweeper = false, Defaults = new OperationOptions { EveryItems = 4 } });
+        FakeLogCollector collector = new();
+        using ILoggerFactory factory = LoggerFactory.Create(builder => builder.AddProvider(new FakeLoggerProvider(collector)));
+        using OperationLogger logger = new(factory, monitor, TimeProvider.System);
+
+        monitor.Failure = new OptionsValidationException(Options.DefaultName, typeof(ThrottledLoggingOptions), ["EveryItems is too small for this app."]);
+        Exception? thrown = Record.Exception(() => monitor.Raise(new ThrottledLoggingOptions()));
+
+        Assert.Null(thrown);
+        Assert.Contains(collector.GetSnapshot(), static r => r.Id.Id == 9011);
+        Assert.Equal(4, logger.DefaultOptions.EveryItems);
+    }
+
     private static void RunItem(IOperationScope operation, string label)
     {
         using IItemScope item = operation.BeginItem(label);
@@ -244,7 +260,16 @@ public sealed class ConfigurationTests
     {
         private Action<ThrottledLoggingOptions, string?>? _listener;
 
-        public ThrottledLoggingOptions CurrentValue { get; set; } = initial;
+        private ThrottledLoggingOptions _current = initial;
+
+        /// <summary>When set, reading <see cref="CurrentValue"/> throws it, as registered validation does.</summary>
+        public Exception? Failure { get; set; }
+
+        public ThrottledLoggingOptions CurrentValue
+        {
+            get => Failure is null ? _current : throw Failure;
+            set => _current = value;
+        }
 
         public ThrottledLoggingOptions Get(string? name) => CurrentValue;
 

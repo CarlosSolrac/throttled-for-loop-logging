@@ -58,8 +58,8 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
     private readonly ManualResetEventSlim _disposeFinished = new(initialState: false);
     private int _disposingThreadId;
 
-    /// <summary>How long <see cref="Dispose"/> waits for the background sweeper to stop.</summary>
-    private static readonly TimeSpan SweeperStopTimeout = TimeSpan.FromSeconds(5);
+    /// <summary>How long <see cref="Dispose"/> waits for the background sweeper to stop. Settable for tests.</summary>
+    internal TimeSpan SweeperStopTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
     /// How long <see cref="Dispose"/> waits, in total, for operations whose lock another thread is
@@ -329,7 +329,13 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
             return;
         }
 
-        _disposeFinished.Wait(SweeperStopTimeout + ShutdownLockTimeout);
+        TimeSpan bound = SweeperStopTimeout + ShutdownLockTimeout;
+        if (!_disposeFinished.Wait(bound))
+        {
+            // Waiting longer could hang host shutdown behind a provider that never returns, so this
+            // call gives up, but says so: its caller should not assume the providers are free yet.
+            IgnoreFailure(() => Log.SecondDisposeTimedOut(_selfLogger, bound.TotalSeconds));
+        }
     }
 
     private void DisposeCore()
@@ -567,8 +573,10 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
             {
                 next = Settings.From(_monitor!.CurrentValue);
             }
-            catch (Exception error) when (error is ArgumentException or InvalidOperationException)
+            catch (Exception error) when (error is ArgumentException or InvalidOperationException or OptionsValidationException)
             {
+                // OptionsValidationException comes from validation the application registered on
+                // the options, which the monitor runs when CurrentValue is read.
                 IgnoreFailure(() => Log.SettingsReloadRejected(_selfLogger, error));
                 return;
             }
