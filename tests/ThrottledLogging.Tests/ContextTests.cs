@@ -487,6 +487,38 @@ public sealed class ContextTests
     }
 
     [Fact]
+    public async Task A_second_Dispose_waits_for_a_shutdown_flush_deferred_by_a_Dispose_made_inside_an_entry_line()
+    {
+        using RecordingProvider provider = new();
+        using ILoggerFactory factory = LoggerFactory.Create(builder => builder.AddProvider(provider));
+        OperationLogger logger = new(factory, new ThrottledLoggingOptions { EnableSweeper = false }, TimeProvider.System);
+        Task? second = null;
+        bool secondReturnedDuringEntryLine = true;
+
+        provider.AfterLine = line =>
+        {
+            if (line.EventId != 9000)
+            {
+                return;
+            }
+
+            provider.AfterLine = null;
+
+            // The first Dispose, from inside the entry line: its flush of this operation has to
+            // wait until the line is finished. A second Dispose on another thread must wait too.
+            logger.Dispose();
+            second = Task.Run(logger.Dispose, TestContext.Current.CancellationToken);
+            secondReturnedDuringEntryLine = second.Wait(500, TestContext.Current.CancellationToken);
+        };
+
+        logger.BeginOperation("ImportOrders");
+
+        Assert.False(secondReturnedDuringEntryLine);
+        await second!.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        Assert.Contains(provider.Lines, l => l.EventId == 9008);
+    }
+
+    [Fact]
     public void A_throwing_provider_at_the_end_still_retires_the_operation()
     {
         using RecordingProvider provider = new() { ThrowWhen = l => l.EventId == 9001 };

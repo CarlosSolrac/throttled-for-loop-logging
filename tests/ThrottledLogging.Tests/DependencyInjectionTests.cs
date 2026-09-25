@@ -75,6 +75,17 @@ public sealed class DependencyInjectionTests
     }
 
     [Fact]
+    public void A_null_configure_delegate_is_rejected_and_is_not_ambiguous()
+    {
+        ServiceCollection services = new();
+
+        // Not ambiguous with AddThrottledLogging(IConfiguration, Action? configure = null): C# prefers
+        // the overload that needs no default argument filled in. This stops compiling if that ever
+        // changes, which would break existing one-argument callers.
+        Assert.Throws<ArgumentNullException>(() => services.AddThrottledLogging(null!));
+    }
+
+    [Fact]
     public void Invalid_options_are_rejected_when_the_operation_starts()
     {
         using TestHarness harness = new();

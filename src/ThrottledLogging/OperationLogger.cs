@@ -58,6 +58,10 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
     private readonly ManualResetEventSlim _disposeFinished = new(initialState: false);
     private int _disposingThreadId;
 
+    // What the first Dispose still has to finish before _disposeFinished is set: its own pass, plus
+    // one for each shutdown flush it had to defer until an entry line was written.
+    private int _disposeWorkOutstanding = 1;
+
     /// <summary>How long <see cref="Dispose"/> waits for the background sweeper to stop. Settable for tests.</summary>
     internal TimeSpan SweeperStopTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
@@ -311,6 +315,21 @@ public sealed class OperationLogger : IOperationLogger, IOperationRegistry, IDis
             DisposeCore();
         }
         finally
+        {
+            CompleteDisposeWork();
+        }
+    }
+
+    /// <summary>
+    /// Notes a shutdown flush deferred until an entry line has been written, so a second
+    /// <see cref="Dispose"/> keeps waiting for it. Balanced by <see cref="CompleteDisposeWork"/>.
+    /// </summary>
+    internal void DeferDisposeWork() => Interlocked.Increment(ref _disposeWorkOutstanding);
+
+    /// <summary>Marks one piece of the first <see cref="Dispose"/> done; the last one lets a second call return.</summary>
+    internal void CompleteDisposeWork()
+    {
+        if (Interlocked.Decrement(ref _disposeWorkOutstanding) == 0)
         {
             _disposeFinished.Set();
         }

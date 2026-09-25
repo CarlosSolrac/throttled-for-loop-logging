@@ -208,12 +208,14 @@ internal sealed class OperationScope : IOperationScope
     /// </summary>
     public void ExitAfterEntry()
     {
+        bool deferred = false;
         try
         {
             _entryInProgress = false;
             if (_flushAfterEntry)
             {
                 _flushAfterEntry = false;
+                deferred = true;
                 FlushForShutdownLocked();
             }
         }
@@ -225,7 +227,19 @@ internal sealed class OperationScope : IOperationScope
         }
         finally
         {
-            ExitLock(outermost: true);
+            try
+            {
+                ExitLock(outermost: true);
+            }
+            finally
+            {
+                // After the lock is released and its notifications delivered, so a second Dispose
+                // waiting on this returns only once the deferred flush has fully finished.
+                if (deferred)
+                {
+                    _owner.CompleteDisposeWork();
+                }
+            }
         }
     }
 
@@ -373,8 +387,14 @@ internal sealed class OperationScope : IOperationScope
             {
                 // Only this thread can be inside the entry line while holding the lock, so this is
                 // a provider disposing the logger from inside it. Writing now would put "still
-                // running" ahead of "started" for every provider after this one.
-                _flushAfterEntry = true;
+                // running" ahead of "started" for every provider after this one. Dispose is not
+                // finished until that deferred flush is, so a second Dispose waits for it too.
+                if (!_flushAfterEntry)
+                {
+                    _flushAfterEntry = true;
+                    _owner.DeferDisposeWork();
+                }
+
                 return true;
             }
 

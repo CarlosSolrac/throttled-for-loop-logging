@@ -212,6 +212,11 @@ mounted Kubernetes ConfigMap):
   below the minimum) are rejected as a whole: the library logs event 9011 at `Warning` with the reason, and the last good
   settings stay in force. Settings invalid at startup still throw, when `OperationLogger` is first
   resolved.
+- **Validation you register yourself** (`AddOptions<ThrottledLoggingOptions>().Validate(...)`,
+  `ValidateDataAnnotations()`) runs inside .NET's options monitor, before the library sees the new
+  settings. A reload that fails it throws `OptionsValidationException` from the reload itself
+  (wrapped in an `AggregateException` by `IConfigurationRoot.Reload()`), no 9011 is written, and the
+  library keeps the last good settings.
 
 In Azure Functions, changing an app setting in the portal restarts the worker anyway, so reload
 matters mostly where configuration changes underneath a running process.
@@ -1175,13 +1180,11 @@ for long runs.
 - **New API:** `OperationOptions.Scope`; `AddThrottledLogging(IConfiguration, Action<ThrottledLoggingOptions>?)`
   to bind settings from configuration and follow reloads; an `OperationLogger` constructor taking
   `IOptionsMonitor<ThrottledLoggingOptions>`. Nothing was removed and no default changed.
-- **Source compatibility:** `services.AddThrottledLogging(null)` written with a bare `null` no longer
-  compiles, because it now matches both the `Action<ThrottledLoggingOptions>` overload and the new
-  `IConfiguration` one. It only ever threw `ArgumentNullException`; drop the call's argument, or
-  cast the `null`, to pick an overload.
 - **Items that finish late:** an item completed after its operation has ended is now ignored. It
   used to be counted into a channel no one would flush, and could even write a line after the
-  operation's closing line.
+  operation's closing line. One finishing on another thread at the very instant the operation ends
+  can still slip through, write one line after the closing line and be missing from the logger's
+  totals; ending an operation while its items are still running is a caller error.
 - **New dependency:** `Microsoft.Extensions.Options.ConfigurationExtensions` 8.0.0 or later, for
   the binding overload.
 - **Settings are copied when `OperationLogger` is built.** Changing a `ThrottledLoggingOptions`
